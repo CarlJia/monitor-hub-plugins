@@ -1,0 +1,19 @@
+# Build outputs
+target/
+**/target/
+*.wasm
+plugin.wasm
+plugin.tar.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local config
+.env
+.env.local
