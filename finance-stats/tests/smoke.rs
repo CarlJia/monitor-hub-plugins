@@ -825,7 +825,10 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
 /// (实测 20 台约 150 万 fuel、100 台约 580 万)。
 #[test]
 fn page_renders_within_the_production_fuel_budget() {
-    /// 宿主的 `plugin.hook_fuel_limit` 默认值,见仓库 README 的资源限制表。
+    /// 宿主的 `plugin.hook_fuel_limit` 默认值。真源是 monitor 仓
+    /// `src/plugin/host.rs` 的 `DEFAULT_HOOK_FUEL_LIMIT`(拆仓时值为 20_000_000）。
+    /// 这是跨仓手抄常量:monitor 调低它而这里没跟,本测试会用旧预算假绿,
+    /// 而生产页面开始 502。改宿主该常量时同步这里。
     const PROD_HOOK_FUEL: u64 = 20_000_000;
     let engine = engine();
     let wasm = build_wasm();

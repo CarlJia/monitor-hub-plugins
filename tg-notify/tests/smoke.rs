@@ -1,6 +1,7 @@
 //! 端到端冒烟测试（U8）：先 `cargo build` 出真实的 wasm 产物，再用 wasmtime
-//! 复刻 hub 的宿主环境（6 个宿主函数 + fuel 限额，语义照抄 src/plugin.rs 的
-//! host_linker），把模块加载起来驱动三种事件。
+//! 复刻 hub 的宿主环境（本插件用到的那几个宿主函数 + fuel 限额，语义照抄
+//! monitor 仓 `src/plugin/host_funcs.rs` 的 host_linker），把模块加载起来驱动
+//! 三种事件。
 //!
 //! 这是插件级的真实验证：不 mock 插件代码，只 mock 宿主——与生产路径的差别
 //! 仅在于 http 请求不走网络、kv 不落 SQLite。
