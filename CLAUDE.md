@@ -12,7 +12,7 @@ ABI 字段表、host_funcs 实现、manifest 校验逻辑**不在本仓**——�
 - **host 函数实现**：`monitor/src/plugin/host_funcs.rs`（14 个函数）
 - **manifest 校验**：`monitor/src/plugin/manifest.rs`
 
-改 ABI 必须先在 monitor 仓改 host_funcs.rs / manifest.rs；本仓的 `abi-check.yml` 会在 monitor 主分支 push 后自动验证本仓插件是否与新 ABI 兼容。
+改 ABI 必须先在 monitor 仓改 host_funcs.rs / manifest.rs。本仓的 ABI 兼容性有两道检查：`ci.yml` 在每次 push/PR 上跑一道便宜的 ABI 门（对照 monitor 当前 `ABI_VERSION` 校验各 `plugin.toml`）；`abi-check.yml` 每小时轮询 monitor 主分支 HEAD，HEAD 未变时跳过，变则读取 `ABI_VERSION` 并重跑契约测试。注意 `workflow_run` 不能跨仓触发，所以是轮询而非 push 即时。
 
 ## 工作流
 

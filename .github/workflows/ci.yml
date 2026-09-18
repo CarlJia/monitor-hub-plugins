@@ -10,7 +10,42 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
+  # Cheap ABI gate on every push/PR: no checkout of monitor, no toolchain.
+  # Reads monitor's ABI_VERSION over the API and checks it against every
+  # plugin's declared abi_version. This catches a wrong plugin.toml on the PR
+  # that opened it, rather than waiting for abi-check.yml's hourly poll (which
+  # is gated on monitor's HEAD moving). The plugin roster is derived from
+  # */plugin.toml so a new plugin is covered without editing this file.
+  abi-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check each plugin's abi_version against monitor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          manifest=$(gh api repos/CarlJia/monitor/contents/src/plugin/manifest.rs --jq .content | base64 -d)
+          abi=$(printf '%s' "$manifest" | grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' | grep -oE '[0-9]+$')
+          test -n "$abi" || { echo "::error::could not read ABI_VERSION from monitor/src/plugin/manifest.rs"; exit 1; }
+          echo "monitor ABI_VERSION: $abi"
+          fail=0
+          for toml in */plugin.toml; do
+            p=${toml%/plugin.toml}
+            declared=$(grep -oE '^abi_version *= *[0-9]+' "$toml" | grep -oE '[0-9]+$')
+            if [ "$declared" != "$abi" ]; then
+              echo "::error file=$toml::$p declares abi_version=$declared, monitor is $abi"
+              fail=1
+            else
+              echo "$p: abi_version=$declared OK"
+            fi
+          done
+          exit $fail
+
   # Each plugin is its own cdylib crate with its own Cargo.lock, so a matrix
   # keeps their target/ caches and failures independent.
   plugins:
