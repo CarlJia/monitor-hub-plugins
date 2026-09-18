@@ -14,12 +14,31 @@ permissions:
   contents: read
 
 jobs:
+  # Single source of truth for the plugin roster: every top-level dir that has a
+  # plugin.toml. Both the abi-gate and the build/test matrix consume this, so a
+  # new plugin is picked up everywhere without editing this file (no hardcoded
+  # [tg-notify, finance-stats] list that abi-gate's glob and this matrix could
+  # drift apart on).
+  set-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      plugins: ${{ steps.discover.outputs.plugins }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: discover
+        run: |
+          plugins=$(for t in */plugin.toml; do printf '%s\n' "${t%/plugin.toml}"; done \
+            | jq -R . | jq -cs .)
+          test "$plugins" != "[]" || { echo "::error::no */plugin.toml found"; exit 1; }
+          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
+          echo "roster: $plugins"
+
   # Cheap ABI gate on every push/PR: no checkout of monitor, no toolchain.
   # Reads monitor's ABI_VERSION over the API and checks it against every
-  # plugin's declared abi_version. This catches a wrong plugin.toml on the PR
-  # that opened it, rather than waiting for abi-check.yml's hourly poll (which
-  # is gated on monitor's HEAD moving). The plugin roster is derived from
-  # */plugin.toml so a new plugin is covered without editing this file.
+  # plugin's declared abi_version. Catches a wrong plugin.toml on the PR that
+  # opened it, rather than waiting for abi-check.yml's hourly poll (gated on
+  # monitor's HEAD moving). Roster derived from */plugin.toml.
   abi-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -36,8 +55,11 @@ jobs:
           fail=0
           for toml in */plugin.toml; do
             p=${toml%/plugin.toml}
-            declared=$(grep -oE '^abi_version *= *[0-9]+' "$toml" | grep -oE '[0-9]+$')
-            if [ "$declared" != "$abi" ]; then
+            declared=$(grep -oE '^abi_version *= *[0-9]+' "$toml" | grep -oE '[0-9]+$' || true)
+            if [ -z "$declared" ]; then
+              echo "::error file=$toml::$p has no numeric abi_version"
+              fail=1
+            elif [ "$declared" != "$abi" ]; then
               echo "::error file=$toml::$p declares abi_version=$declared, monitor is $abi"
               fail=1
             else
@@ -47,20 +69,22 @@ jobs:
           exit $fail
 
   # Each plugin is its own cdylib crate with its own Cargo.lock, so a matrix
-  # keeps their target/ caches and failures independent.
+  # keeps their target/ caches and failures independent. Roster comes from
+  # set-matrix so a new plugin dir is built and tested without editing here.
   plugins:
+    needs: set-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        plugin: [tg-notify, finance-stats]
+        plugin: ${{ fromJSON(needs.set-matrix.outputs.plugins) }}
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Per-plugin cache pool — the two jobs share a name, so without the key
+      # Per-plugin cache pool — the jobs share a name, so without the key
       # they would overwrite each other's cache.
       - uses: Swatinem/rust-cache@v2
         with:

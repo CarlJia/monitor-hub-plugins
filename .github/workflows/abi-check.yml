@@ -101,10 +101,13 @@ jobs:
         if: steps.monref.outputs.changed == 'true'
         run: |
           fail=0
-          for p in tg-notify finance-stats; do
-            declared=$(grep -oE '^abi_version *= *[0-9]+' "$p/plugin.toml" | grep -oE '[0-9]+$')
-            if [ "$declared" != "${{ steps.monitor_abi.outputs.abi }}" ]; then
-              echo "::error file=$p/plugin.toml::$p declares abi_version=$declared, monitor is ${{ steps.monitor_abi.outputs.abi }}"
+          for toml in */plugin.toml; do            # roster derived, not hardcoded
+            p=${toml%/plugin.toml}
+            declared=$(grep -oE '^abi_version *= *[0-9]+' "$toml" | grep -oE '[0-9]+$' || true)
+            if [ -z "$declared" ]; then
+              echo "::error file=$toml::$p has no numeric abi_version"; fail=1
+            elif [ "$declared" != "${{ steps.monitor_abi.outputs.abi }}" ]; then
+              echo "::error file=$toml::$p declares abi_version=$declared, monitor is ${{ steps.monitor_abi.outputs.abi }}"
               fail=1
             fi
           done
@@ -114,7 +117,8 @@ jobs:
         id: tests
         if: steps.monref.outputs.changed == 'true'
         run: |
-          for p in tg-notify finance-stats; do
+          for toml in */plugin.toml; do
+            p=${toml%/plugin.toml}
             echo "::group::$p"
             (cd "$p" && cargo test)
             echo "::endgroup::"
@@ -134,15 +138,18 @@ jobs:
             echo
             echo "| plugin | declared abi_version |"
             echo "|---|---|"
-            for p in tg-notify finance-stats; do
-              d=$(grep -oE '^abi_version *= *[0-9]+' "$p/plugin.toml" | grep -oE '[0-9]+$')
+            for toml in */plugin.toml; do
+              p=${toml%/plugin.toml}
+              d=$(grep -oE '^abi_version *= *[0-9]+' "$toml" | grep -oE '[0-9]+$')
               echo "| $p | $d |"
             done
             echo
+            echo "_Scope: this checks the declared \`abi_version\` integer against monitor@${short}, and runs each plugin's smoke suite against its **wasmtime stub host** (tests/smoke.rs) — not monitor's real host. A host_funcs.rs signature/semantics change that keeps ABI_VERSION the same is NOT caught here._"
+            echo
             if [ "$outcome" = "success" ]; then
-              echo "**Result: compatible** with monitor@${short}."
+              echo "**Result: abi_version matches monitor@${short} and stub smoke tests pass.**"
             else
-              echo "**Result: INCOMPATIBLE** with monitor@${short}. Fix the plugin against that monitor commit before releasing."
+              echo "**Result: FAILED against monitor@${short}** — abi_version mismatch or a failing smoke test. Fix the plugin against that monitor commit before releasing."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

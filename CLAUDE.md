@@ -25,6 +25,12 @@ ABI 字段表、host_funcs 实现、manifest 校验逻辑**不在本仓**——�
 - 当前所有插件从 `1.0.0` 起（拆仓点 fresh-start）
 - Patch = bug fix；Minor = 新增功能（保持 ABI v2 兼容）；Major = 破坏 ABI 兼容（需 monitor 先 bump）
 
-## 跨仓信号
+## 跨仓信号与它的边界（重要）
 
-`abi-check.yml` 的 workflow summary 是 plugin author 看到的 ABI 兼容性状态；monitor ABI 升时这里会自动跑验证。
+两道门校验的都是**声明的整数 `abi_version`**,契约测试跑的是**仓内 wasmtime 桩宿主**（`tests/smoke.rs`）——**不是** monitor 的真实宿主。因此下面这些**不会被任何门发现**,只在生产实例化/运行时炸:
+
+- 改 `host_funcs.rs` 的函数签名/语义但**没 bump** `ABI_VERSION`（整数没变 → 全绿；桩没跟着改 → 桩测试也绿）
+- 调 monitor 的运行时预算（如 `DEFAULT_HOOK_FUEL_LIMIT`）——不属于 ABI，无门反应；smoke 里的 `PROD_HOOK_FUEL` 是**手抄**常量
+- quota / SSRF / deadline / record-cap 等宿主行为——桩不强制
+
+跨仓 ABI 一致性目前**靠人工纪律**（bump 整数、保持桩与真宿主同步）。要根治需在 monitor 侧加「host import 面 fingerprint 测试」或「真宿主契约 harness」,那是独立于本次拆仓的工作。
