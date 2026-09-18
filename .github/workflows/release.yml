@@ -48,11 +48,13 @@ jobs:
           version="${tag#"${plugin}-"}"
 
           # Changelog: this plugin's commits since its previous tag.
+          # (The subtree-grafted history has several root commits, so take a
+          # single one for the first-release range.)
           prev=$(git tag --list "${plugin}-v*" --sort=-v:refname | grep -vx "$tag" | head -1)
           if [ -n "$prev" ]; then
             range="${prev}..${tag}"
           else
-            range="$(git rev-list --max-parents=0 HEAD)..${tag}"
+            range="$(git rev-list --max-parents=0 HEAD | head -1)..${tag}"
           fi
           notes=$(git log --no-decorate --pretty='- %s (%h)' "$range" -- "${plugin}/")
 
