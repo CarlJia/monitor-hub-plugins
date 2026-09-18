@@ -1,8 +1,12 @@
 name: abi-check
 
-# Re-runs the plugin contract tests against the exact monitor build whose ci
-# just finished on main, so ABI drift surfaces here (the plugins' own repo)
-# rather than at upload time.
+# Re-runs the plugin contract tests against a specific monitor build, so ABI
+# drift surfaces here (the plugins' own repo) rather than at upload time.
+#
+# Triggers:
+#   - workflow_run: fires automatically when monitor's ci finishes on main.
+#   - workflow_dispatch: manual re-check (against monitor's default branch, or
+#     a given ref) — also the testing/escape hatch for this workflow.
 #
 # What this proves, and what it does not:
 #   - It DOES gate on monitor's real ABI: the step reads ABI_VERSION straight
@@ -19,6 +23,12 @@ on:
     # Must match monitor's ci.yml `name:`.
     workflows: ["ci"]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      monitor_ref:
+        description: "monitor ref to check against (default: main)"
+        required: false
+        default: main
 
 permissions:
   contents: read
@@ -26,18 +36,27 @@ permissions:
 
 jobs:
   contract:
-    # Only a green monitor run is worth checking the plugins against.
-    if: github.event.workflow_run.conclusion == 'success'
+    # Automatic runs only proceed on a green monitor ci; manual runs always run.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
-      - name: Checkout monitor at the triggering sha
+      - name: Resolve the monitor ref under test
+        id: monref
+        run: |
+          ref='${{ github.event.workflow_run.head_sha }}'
+          if [ -z "$ref" ]; then ref='${{ github.event.inputs.monitor_ref }}'; fi
+          if [ -z "$ref" ]; then ref='main'; fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "short=$(printf '%s' "$ref" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout monitor at the resolved ref
         uses: actions/checkout@v7
         with:
           repository: CarlJia/monitor
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ steps.monref.outputs.ref }}
           path: .monitor
 
       - uses: dtolnay/rust-toolchain@stable
@@ -78,11 +97,11 @@ jobs:
       - name: Workflow summary
         if: always()
         run: |
-          sha='${{ github.event.workflow_run.head_sha }}'
+          short='${{ steps.monref.outputs.short }}'
           abi='${{ steps.monitor_abi.outputs.abi }}'
           outcome='${{ steps.tests.outcome }}'
           {
-            echo "## ABI check vs monitor@${sha:0:7}"
+            echo "## ABI check vs monitor@${short}"
             echo
             echo "- monitor ABI_VERSION: \`${abi:-unknown}\`"
             echo "- contract tests: \`${outcome:-unknown}\`"
@@ -93,16 +112,15 @@ jobs:
               d=$(grep -oE '^abi_version *= *[0-9]+' "$p/plugin.toml" | grep -oE '[0-9]+$')
               echo "| $p | $d |"
             done
-            if [ "$outcome" != "success" ]; then
-              echo
-              echo "**Result: INCOMPATIBLE** with monitor@${sha:0:7}. Fix the plugin against that monitor commit before releasing."
+            echo
+            if [ "$outcome" = "success" ]; then
+              echo "**Result: compatible** with monitor@${short}."
             else
-              echo
-              echo "**Result: compatible** with monitor@${sha:0:7}."
+              echo "**Result: INCOMPATIBLE** with monitor@${short}. Fix the plugin against that monitor commit before releasing."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Surface the result as a commit status on this repo's main so plugin
+      # Surface the result as a commit status on this repo's head so plugin
       # authors see drift without opening the Actions tab.
       - name: Commit status
         if: always()
@@ -114,5 +132,5 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" \
             -f state="$state" \
             -f context='abi-check' \
-            -f description="vs monitor@$(echo '${{ github.event.workflow_run.head_sha }}' | cut -c1-7)" \
+            -f description="vs monitor@${{ steps.monref.outputs.short }}" \
             >/dev/null
