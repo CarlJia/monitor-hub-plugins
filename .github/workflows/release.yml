@@ -1,0 +1,66 @@
+name: release
+
+# One tag per plugin: tg-notify-vX.Y.Z / finance-stats-vX.Y.Z. Each tag builds
+# and publishes only its own plugin, so the two release trains are independent.
+
+on:
+  push:
+    tags:
+      - "tg-notify-v*"
+      - "finance-stats-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the changelog range below can resolve the previous
+          # tag for this plugin.
+          fetch-depth: 0
+
+      - name: Resolve plugin from tag
+        id: plugin
+        run: |
+          case "$GITHUB_REF_NAME" in
+            tg-notify-v*)     echo "id=tg-notify"     >> "$GITHUB_OUTPUT" ;;
+            finance-stats-v*) echo "id=finance-stats" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unexpected tag $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: rustup target add wasm32-unknown-unknown
+
+      # Reuse the plugin's own build script — it knows the wasm artifact name
+      # and packages plugin.tar.gz (plugin.toml + plugin.wasm).
+      - run: ./build.sh
+        working-directory: ${{ steps.plugin.outputs.id }}
+
+      - name: Publish release
+        run: |
+          tag="$GITHUB_REF_NAME"
+          plugin='${{ steps.plugin.outputs.id }}'
+          version="${tag#"${plugin}-"}"
+
+          # Changelog: this plugin's commits since its previous tag.
+          prev=$(git tag --list "${plugin}-v*" --sort=-v:refname | grep -vx "$tag" | head -1)
+          if [ -n "$prev" ]; then
+            range="${prev}..${tag}"
+          else
+            range="$(git rev-list --max-parents=0 HEAD)..${tag}"
+          fi
+          notes=$(git log --no-decorate --pretty='- %s (%h)' "$range" -- "${plugin}/")
+
+          # `gh` ships on the runner; keeping the third-party action out of the
+          # contents:write step, matching the monitor repo's release workflow.
+          gh release create "$tag" "${plugin}/plugin.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${plugin} ${version}" \
+            --notes "${notes:-No commits touching ${plugin}/ since ${prev:-the initial commit}.}"
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes any run still in progress for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Each plugin is its own cdylib crate with its own Cargo.lock, so a matrix
+  # keeps their target/ caches and failures independent.
+  plugins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [tg-notify, finance-stats]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Per-plugin cache pool — the two jobs share a name, so without the key
+      # they would overwrite each other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.plugin }}
+          workspaces: "${{ matrix.plugin }} -> target"
+
+      # The smoke test nested-builds the wasm32 artifact, so the target is
+      # needed even though the test binary itself runs on the host.
+      - run: rustup target add wasm32-unknown-unknown
+
+      - run: cargo test
+        working-directory: ${{ matrix.plugin }}

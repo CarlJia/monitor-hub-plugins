@@ -1,0 +1,118 @@
+name: abi-check
+
+# Re-runs the plugin contract tests against the exact monitor build whose ci
+# just finished on main, so ABI drift surfaces here (the plugins' own repo)
+# rather than at upload time.
+#
+# What this proves, and what it does not:
+#   - It DOES gate on monitor's real ABI: the step reads ABI_VERSION straight
+#     out of monitor's src/plugin/manifest.rs and fails any plugin whose
+#     plugin.toml declares a different abi_version.
+#   - The smoke tests themselves drive each plugin through a wasmtime STUB host
+#     defined in tests/smoke.rs — they do not load monitor's real host. So a
+#     pure host_funcs.rs signature change the stub has not mirrored is not
+#     caught here. Keeping the stub in step with monitor is the plugin
+#     author's job; the monitor repo is the ABI authority.
+
+on:
+  workflow_run:
+    # Must match monitor's ci.yml `name:`.
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  contract:
+    # Only a green monitor run is worth checking the plugins against.
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout monitor at the triggering sha
+        uses: actions/checkout@v7
+        with:
+          repository: CarlJia/monitor
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: .monitor
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: rustup target add wasm32-unknown-unknown
+
+      - name: Read monitor's ABI version
+        id: monitor_abi
+        run: |
+          abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' .monitor/src/plugin/manifest.rs | grep -oE '[0-9]+$')
+          test -n "$abi" || { echo "::error::could not read ABI_VERSION from monitor/src/plugin/manifest.rs"; exit 1; }
+          echo "abi=$abi" >> "$GITHUB_OUTPUT"
+          echo "monitor ABI version: $abi"
+
+      - name: Check every plugin's declared abi_version
+        run: |
+          fail=0
+          for p in tg-notify finance-stats; do
+            declared=$(grep -oE '^abi_version *= *[0-9]+' "$p/plugin.toml" | grep -oE '[0-9]+$')
+            if [ "$declared" != "${{ steps.monitor_abi.outputs.abi }}" ]; then
+              echo "::error file=$p/plugin.toml::$p declares abi_version=$declared, monitor is ${{ steps.monitor_abi.outputs.abi }}"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Run plugin contract tests
+        id: tests
+        run: |
+          for p in tg-notify finance-stats; do
+            echo "::group::$p"
+            (cd "$p" && cargo test)
+            echo "::endgroup::"
+          done
+
+      - name: Workflow summary
+        if: always()
+        run: |
+          sha='${{ github.event.workflow_run.head_sha }}'
+          abi='${{ steps.monitor_abi.outputs.abi }}'
+          outcome='${{ steps.tests.outcome }}'
+          {
+            echo "## ABI check vs monitor@${sha:0:7}"
+            echo
+            echo "- monitor ABI_VERSION: \`${abi:-unknown}\`"
+            echo "- contract tests: \`${outcome:-unknown}\`"
+            echo
+            echo "| plugin | declared abi_version |"
+            echo "|---|---|"
+            for p in tg-notify finance-stats; do
+              d=$(grep -oE '^abi_version *= *[0-9]+' "$p/plugin.toml" | grep -oE '[0-9]+$')
+              echo "| $p | $d |"
+            done
+            if [ "$outcome" != "success" ]; then
+              echo
+              echo "**Result: INCOMPATIBLE** with monitor@${sha:0:7}. Fix the plugin against that monitor commit before releasing."
+            else
+              echo
+              echo "**Result: compatible** with monitor@${sha:0:7}."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Surface the result as a commit status on this repo's main so plugin
+      # authors see drift without opening the Actions tab.
+      - name: Commit status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state='${{ steps.tests.outcome == 'success' && 'success' || 'failure' }}'
+          sha=$(git rev-parse HEAD)
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" \
+            -f state="$state" \
+            -f context='abi-check' \
+            -f description="vs monitor@$(echo '${{ github.event.workflow_run.head_sha }}' | cut -c1-7)" \
+            >/dev/null
