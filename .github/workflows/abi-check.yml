@@ -1,12 +1,17 @@
 name: abi-check
 
-# Re-runs the plugin contract tests against a specific monitor build, so ABI
-# drift surfaces here (the plugins' own repo) rather than at upload time.
+# Checks the plugins against monitor's current ABI and reports drift.
 #
 # Triggers:
-#   - workflow_run: fires automatically when monitor's ci finishes on main.
-#   - workflow_dispatch: manual re-check (against monitor's default branch, or
-#     a given ref) — also the testing/escape hatch for this workflow.
+#   - schedule: polls monitor's default-branch HEAD; skips the heavy steps when
+#     it has not moved since the last check (the last-seen sha is carried in
+#     this repo's `abi-check` commit status target_url).
+#   - workflow_dispatch: manual re-check against a given ref.
+#
+# NOTE on why there is no `workflow_run` trigger: GitHub only fires
+# `workflow_run` for workflows in the SAME repository, so it cannot listen to
+# monitor's ci. Cross-repo event delivery needs `repository_dispatch` (a
+# token in monitor); polling is the zero-secret alternative.
 #
 # What this proves, and what it does not:
 #   - It DOES gate on monitor's real ABI: the step reads ABI_VERSION straight
@@ -19,10 +24,8 @@ name: abi-check
 #     author's job; the monitor repo is the ABI authority.
 
 on:
-  workflow_run:
-    # Must match monitor's ci.yml `name:`.
-    workflows: ["ci"]
-    types: [completed]
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       monitor_ref:
@@ -36,37 +39,58 @@ permissions:
 
 jobs:
   contract:
-    # Automatic runs only proceed on a green monitor ci; manual runs always run.
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
-      - name: Resolve the monitor ref under test
+      - name: Resolve monitor head; skip if unchanged
         id: monref
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          ref='${{ github.event.workflow_run.head_sha }}'
-          if [ -z "$ref" ]; then ref='${{ github.event.inputs.monitor_ref }}'; fi
-          if [ -z "$ref" ]; then ref='main'; fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "short=$(printf '%s' "$ref" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          ref='${{ github.event.inputs.monitor_ref }}'
+          [ -n "$ref" ] || ref='main'
+          sha=$(gh api "repos/CarlJia/monitor/commits/$ref" --jq .sha)
+          echo "short=$(printf '%s' "$sha" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/CarlJia/monitor/commit/$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout monitor at the resolved ref
+          # Manual runs always proceed; scheduled runs skip when monitor's head
+          # matches the sha recorded by the previous check.
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          prev=$(gh api "repos/$GITHUB_REPOSITORY/commits/main/statuses" \
+                   --jq '[.[] | select(.context=="abi-check")][0].target_url // ""' 2>/dev/null || true)
+          if [ "${prev##*/}" = "$sha" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "monitor head unchanged (${{ github.event_name }}); skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout monitor at the resolved sha
+        if: steps.monref.outputs.changed == 'true'
         uses: actions/checkout@v7
         with:
           repository: CarlJia/monitor
-          ref: ${{ steps.monref.outputs.ref }}
+          ref: ${{ steps.monref.outputs.sha }}
           path: .monitor
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.monref.outputs.changed == 'true'
 
       - uses: Swatinem/rust-cache@v2
+        if: steps.monref.outputs.changed == 'true'
 
       - run: rustup target add wasm32-unknown-unknown
+        if: steps.monref.outputs.changed == 'true'
 
       - name: Read monitor's ABI version
         id: monitor_abi
+        if: steps.monref.outputs.changed == 'true'
         run: |
           abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' .monitor/src/plugin/manifest.rs | grep -oE '[0-9]+$')
           test -n "$abi" || { echo "::error::could not read ABI_VERSION from monitor/src/plugin/manifest.rs"; exit 1; }
@@ -74,6 +98,7 @@ jobs:
           echo "monitor ABI version: $abi"
 
       - name: Check every plugin's declared abi_version
+        if: steps.monref.outputs.changed == 'true'
         run: |
           fail=0
           for p in tg-notify finance-stats; do
@@ -87,6 +112,7 @@ jobs:
 
       - name: Run plugin contract tests
         id: tests
+        if: steps.monref.outputs.changed == 'true'
         run: |
           for p in tg-notify finance-stats; do
             echo "::group::$p"
@@ -95,7 +121,7 @@ jobs:
           done
 
       - name: Workflow summary
-        if: always()
+        if: always() && steps.monref.outputs.changed == 'true'
         run: |
           short='${{ steps.monref.outputs.short }}'
           abi='${{ steps.monitor_abi.outputs.abi }}'
@@ -120,10 +146,10 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Surface the result as a commit status on this repo's head so plugin
-      # authors see drift without opening the Actions tab.
+      # Records the result AND the monitor sha just checked (in target_url), so
+      # the next scheduled run can skip when monitor has not moved.
       - name: Commit status
-        if: always()
+        if: always() && steps.monref.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -133,4 +159,5 @@ jobs:
             -f state="$state" \
             -f context='abi-check' \
             -f description="vs monitor@${{ steps.monref.outputs.short }}" \
+            -f target_url='${{ steps.monref.outputs.url }}' \
             >/dev/null
