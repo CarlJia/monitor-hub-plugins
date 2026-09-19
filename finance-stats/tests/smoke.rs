@@ -58,6 +58,8 @@ fn engine() -> Engine {
 struct Host {
     /// plugin_data 命名空间（单插件，key → value）。
     data: Mutex<HashMap<String, String>>,
+    /// 面板 kv（「渠道配置」弹窗写入的那份，单插件，key → value）。
+    kv: Mutex<HashMap<String, String>>,
     /// 收到的 emit_event(name, payload)。
     emitted: Mutex<Vec<(String, String)>>,
     /// 节点列表应答（nodes_query）。
@@ -125,6 +127,24 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
         })
         .unwrap();
     linker.func_wrap("host", "now", || -> i64 { NOW }).unwrap();
+
+    // kv_get：面板「渠道配置」弹窗写进来的值（插件自己的命名空间，桩里就是一张表）。
+    linker
+        .func_wrap(
+            "host",
+            "kv_get",
+            |mut caller: Caller<'_, Host>, kp: i32, kl: i32, out_ptr: i32, out_cap: i32| -> i32 {
+                let Some(key) = read_text(&mut caller, kp, kl) else { return -1 };
+                let value = caller.data().kv.lock().unwrap().get(&key).cloned();
+                let Some(value) = value else { return 0 };
+                let n = value.len().min(out_cap.max(0) as usize);
+                if out_ptr > 0 && n > 0 && !write_mem(&mut caller, out_ptr, &value.as_bytes()[..n]) {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .unwrap();
 
     linker
         .func_wrap("host", "resp_alloc", |mut caller: Caller<'_, Host>, cap: i32| -> i32 {
@@ -383,6 +403,11 @@ fn seed(store: &Store<Host>, key: &str, value: &str) {
     store.data().data.lock().unwrap().insert(key.to_owned(), value.to_owned());
 }
 
+/// 往面板 kv（「渠道配置」弹窗）里塞一个值——与 `seed` 是两张不同的表。
+fn seed_kv(store: &Store<Host>, key: &str, value: &str) {
+    store.data().kv.lock().unwrap().insert(key.to_owned(), value.to_owned());
+}
+
 /// 覆盖某个 id 的 `created_at`——模拟「该 id 已被复用给另一台机器」。
 fn set_created_at(store: &Store<Host>, id: i64, created_at: i64) {
     store.data().created_at.lock().unwrap().insert(id, created_at);
@@ -588,7 +613,7 @@ fn overdue_online_node_rolls_forward() {
     assert!(!rec.contains(&past), "到期日应已向后滚动");
 }
 
-/// Covers AE5：进入阈值窗口的节点 emit plugin_expiry_soon，载荷字段完整。
+/// Covers AE5：刚进阈值窗口的节点 emit plugin_expiry_soon，载荷字段完整。
 #[test]
 fn threshold_node_emits_event() {
     let engine = engine();
@@ -604,13 +629,108 @@ fn threshold_node_emits_event() {
 
     tick(&mut store, &instance);
     let events = store.data().emitted.lock().unwrap().clone();
-    assert_eq!(events.len(), 1, "进入阈值窗口发一次");
+    assert_eq!(events.len(), 1, "窗口第一天发一次");
     assert_eq!(events[0].0, "plugin_expiry_soon");
     let payload: serde_json::Value = serde_json::from_str(&events[0].1).unwrap();
     assert_eq!(payload["node_id"], 7);
     assert_eq!(payload["days_left"], 7);
     assert_eq!(payload["threshold_days"], 7);
     assert_eq!(payload["expires_at"], soon);
+}
+
+/// 窗口内每天一条：同一天重复一拍不重复发，跨天（days_left 变小）再发一条。
+#[test]
+fn window_notifies_daily_without_repeating_within_a_day() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((7, "edge-7".into(), false));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+
+    let soon = (today() + chrono::Duration::days(3)).to_string();
+    seed(&store, "node:7", &node_record("edge-7", 10.0, "USD", "monthly", Some(&soon)));
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+
+    assert_eq!(tick(&mut store, &instance), vec!["plugin_expiry_soon"], "进窗口先发一条");
+    // 同一个小时里再来两拍：days_left 没变，一条都不该多发。
+    assert!(tick(&mut store, &instance).is_empty(), "同一天内不该重复提醒");
+    assert!(tick(&mut store, &instance).is_empty(), "同一天内不该重复提醒");
+
+    // 第二天：桩宿主的时钟固定，用「把到期日提前一天」等价表达时间前进一天
+    // （days_left 3 → 2）。记录整条改掉会把被测的 last_notified 一起抹掉，
+    // 所以读出来只改到期日再写回。
+    let mut rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert!(rec.get("last_notified").is_some_and(|v| !v.is_null()), "提醒后应记下当天已发：{rec}");
+    rec["expires_at"] = serde_json::json!((today() + chrono::Duration::days(2)).to_string());
+    seed(&store, "node:7", &rec.to_string());
+
+    assert_eq!(tick(&mut store, &instance), vec!["plugin_expiry_soon"], "跨天应再提醒一条");
+}
+
+/// 窗口外不提醒——不会提前几十天就开始打扰。
+#[test]
+fn outside_window_is_silent() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((7, "edge-7".into(), false));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+
+    let later = (today() + chrono::Duration::days(30)).to_string();
+    seed(&store, "node:7", &node_record("edge-7", 10.0, "USD", "monthly", Some(&later)));
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+
+    assert!(tick(&mut store, &instance).is_empty(), "30 天后到期，7 天窗口外不发");
+}
+
+/// 面板 kv 里的 `threshold_days` 覆盖 config 记录里的值：提醒窗口按 kv 走。
+#[test]
+fn kv_threshold_overrides_config_record() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((7, "edge-7".into(), false));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+
+    let soon = (today() + chrono::Duration::days(3)).to_string();
+    seed(&store, "node:7", &node_record("edge-7", 10.0, "USD", "monthly", Some(&soon)));
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+    seed_kv(&store, "threshold_days", "3");
+
+    tick(&mut store, &instance);
+    let events = store.data().emitted.lock().unwrap().clone();
+    assert_eq!(events.len(), 1, "应落在 kv 的 3 天窗口，而不是 config 的 7 天：{events:?}");
+    let payload: serde_json::Value = serde_json::from_str(&events[0].1).unwrap();
+    assert_eq!(payload["days_left"], 3);
+    assert_eq!(payload["threshold_days"], 3);
+    assert_eq!(payload["expires_at"], soon);
+}
+
+/// kv 里不是正整数时当没配、回退 config 记录——而不是把阈值咽成 0 后静默不发
+/// （`days_left == 0` 永远不成立，通知会一声不响地消失）。
+#[test]
+fn invalid_kv_threshold_falls_back_to_config_record() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((7, "edge-7".into(), false));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+
+    let soon = (today() + chrono::Duration::days(7)).to_string();
+    seed(&store, "node:7", &node_record("edge-7", 10.0, "USD", "monthly", Some(&soon)));
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+    seed_kv(&store, "threshold_days", "0");
+
+    tick(&mut store, &instance);
+    let events = store.data().emitted.lock().unwrap().clone();
+    assert_eq!(events.len(), 1, "0 不是有效阈值，应回退 config 的 7：{events:?}");
+    let payload: serde_json::Value = serde_json::from_str(&events[0].1).unwrap();
+    assert_eq!(payload["threshold_days"], 7);
 }
 
 /// Covers AE3：尚无汇率缓存时页面显示「汇率不可用」。
@@ -1201,9 +1321,8 @@ fn reconcile_keeps_everything_when_nodes_query_fails() {
     host.nodes_error.lock().unwrap().replace(-8);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
     seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
-    // 一台正落在提醒阈值上的机器：宿主读失败**只**该跳过滚动，提醒照发——它读的
-    // 全是插件自己的数据（expires_at + 阈值），按等级精确匹配一次，漏一轮就整个
-    // 计费周期都不会再响。
+    // 一台正落在提醒窗口里的机器：宿主读失败**只**该跳过滚动，提醒照发——它读的
+    // 全是插件自己的数据（expires_at + 阈值 + 去重状态），不依赖宿主那份快照。
     let soon = (today() + chrono::Duration::days(7)).to_string();
     seed(&store, "node:1", &node_record("kept", 5.0, "USD", "monthly", Some(&soon)));
     seed(&store, "node:99", &node_record("gone", 5.0, "USD", "monthly", None));

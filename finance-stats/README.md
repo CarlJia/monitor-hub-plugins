@@ -13,6 +13,20 @@ monitor-hub 的财务统计插件（wasm 插件 ABI v2）。它自持全部节�
 | `on_action` | 页面交互 | `set_currency` / `save_node` / `refresh_fx` |
 | `on_event` | 宿主事件 | 订阅 `node_added` / `node_deleted`，启用期间实时同步该台机器的记录 |
 
+## 配置
+
+面板「插件」页点「配置」打开渠道配置弹窗，里面是 `plugin.toml` 声明的 `[[kv]]`：
+
+| key | 含义 |
+|---|---|
+| `threshold_days` | 到期提醒的提前天数（窗口大小）。正整数，不填默认 7 |
+
+进入窗口（距到期 `≤ threshold_days` 天）后**每天提醒一次**，直到到期。宿主
+`on_tick` 每小时一拍，同一天重复跑不会重复发——插件按记录里上次提醒的天数
+去重。所以填 3 就是最后三天每天一条。
+值非正整数（0、负数、非数字）时当没配，回退到 `plugin_data` 的
+`config.threshold_days`、再回退默认 7——不会静默变成「永不提醒」。
+
 ## 与宿主节点表的关系
 
 插件自持财务数据，记录键是 `node:<id>`、宿主 id。宿主 id 会被 SQLite 复用
@@ -36,9 +50,13 @@ monitor-hub 的财务统计插件（wasm 插件 ABI v2）。它自持全部节�
 
 | key | value |
 |-----|-------|
-| `config` | `{target_currency, threshold_days}` |
+| `config` | `{target_currency, threshold_days}`——`threshold_days` 只是回退，面板 kv 优先 |
 | `fx` | `{base, rates:{CUR:number}, fetched_at}` |
 | `node:<id>` | `{name, price, currency, billing_cycle, expires_at, purchased_at, host_created_at}` |
+
+提醒阈值的来源优先级：面板 kv 的 `threshold_days` → `config` 记录里的
+`threshold_days`（升级前手工写库留下的）→ 默认 7 天。升级不必迁移，旧的
+`config` 记录照常作数。
 
 宿主 node 表自 ABI v2 起不再有价格/币种/周期/到期日列，这些字段的唯一真源
 就是本插件的 `plugin_data`。
@@ -54,7 +72,8 @@ monitor-hub 的财务统计插件（wasm 插件 ABI v2）。它自持全部节�
 - 首次导入建出的记录：价格 0、币种 USD、周期**年付**、无到期日。
 - 面板上新增的机器会立刻建出这样一条空白记录（宿主事件），插件禁用期间新增的
   机器在重新启用时补上；面板删掉机器，记录随之删除。
-- 到期列表窗口与 `plugin_expiry_soon` 阈值共用 `config.threshold_days`（默认 7 天）。
+- 到期列表窗口与 `plugin_expiry_soon` 阈值共用同一个生效值（见「配置」，默认
+  7 天）——页面上看到的窗口就是提醒用的窗口，两处不会对不上。
 
 ## 页面
 
@@ -90,10 +109,10 @@ rustup target add wasm32-unknown-unknown
 cargo test
 ```
 
-测试覆盖了年化换算、剩余价值折算、汇率降级、到期滚动与提醒、免费/一次性
-机器的处理、切币种持久化，以及节点对账（补建 / 删孤儿 / 行序 / id 复用 /
-两种读失败都不改写记录）与 `node_added` / `node_deleted` 事件同步（含生产事件
-预算与身份重投）。
+测试覆盖了年化换算、剩余价值折算、汇率降级、到期滚动与提醒（含窗口内每日
+一次的去重、面板配置的阈值优先）、免费/一次性机器的处理、切币种持久化，以及
+节点对账（补建 / 删孤儿 / 行序 / id 复用 / 两种读失败都不改写记录）与
+`node_added` / `node_deleted` 事件同步（含生产事件预算与身份重投）。
 
 ## 上传与启用
 

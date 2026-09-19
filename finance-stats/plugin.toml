@@ -5,10 +5,20 @@
 # 它自己发出的是 plugin_expiry_soon，由 tg-notify 订阅。
 plugin_id = "io.github.monitor.finance-stats"
 name = "财务统计"
-version = "1.1.0"
+version = "1.2.0"
 abi_version = 2
 subscribes = ["node_added", "node_deleted"]
 tick = true
+
+# 到期提醒的提前天数。面板的「配置」弹窗按这里渲染标签与提示；key 就是
+# kv 的 key（命名空间 plugin.io.github.monitor.finance-stats:<key>），必须与
+# src/lib.rs 里 kv_get_string 读的名字逐字一致。不填就是默认 7 天。
+
+[[kv]]
+key = "threshold_days"
+label = "到期提醒提前天数"
+required = false
+hint = "正整数，默认 7。到期前这些天内每天提醒一次（同一天只提醒一次）"
 
 [page]
 title = "财务统计"
