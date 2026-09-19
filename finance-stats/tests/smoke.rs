@@ -1,7 +1,7 @@
 //! 端到端冒烟测试：先 `cargo build` 出真实的 wasm 产物，再用 wasmtime 复刻
 //! hub 的 ABI v2 宿主环境（log / now / resp_alloc / http_get / nodes_query /
 //! emit_event / data_put / data_get / data_delete / data_list），驱动插件的
-//! on_tick / render_page / on_action / on_cleanup。
+//! on_tick / render_page / on_action / on_event。
 //!
 //! 插件代码不 mock，只 mock 宿主——与生产路径的差别仅在于 http 不走网络、
 //! 数据不落 SQLite。
@@ -19,6 +19,8 @@ use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store};
 const FUEL_LIMIT: u64 = 4_000_000;
 /// 固定"当前时间"：2027-01-15 前后，测试的日期都相对它构造。
 const NOW: i64 = 1_800_000_000;
+/// 桩宿主给节点派生的 `created_at` 基准（加 id，保证同一 id 稳定、不同 id 不同）。
+const DEFAULT_CREATED_AT: i64 = 1_700_000_000;
 
 fn today() -> NaiveDate {
     DateTime::from_timestamp(NOW, 0).unwrap().date_naive()
@@ -67,6 +69,12 @@ struct Host {
     http_error: Mutex<Option<i32>>,
     /// http_get 的调用次数——用来断言"该拉的拉了、不该拉的一次都没拉"。
     http_calls: Mutex<u32>,
+    /// 按 id 覆盖 nodes_query 回的 `created_at`（模拟同一个 id 被复用给另一台机器）。
+    created_at: Mutex<HashMap<i64, i64>>,
+    /// 覆盖 data_list 的返回码：Some 时直接返回该码（模拟超配额/数据库错误）。
+    data_error: Mutex<Option<i32>>,
+    /// 覆盖 nodes_query 的返回码：Some 时直接返回该码（模拟查询失败/超预算）。
+    nodes_error: Mutex<Option<i32>>,
     /// 最近一次 resp_alloc 拿到的缓冲指针与容量（与生产宿主一致）。
     resp: Mutex<(i32, i32)>,
     logs: Mutex<Vec<(i32, String)>>,
@@ -161,19 +169,37 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
         )
         .unwrap();
 
-    // nodes_query：返回 [{id,name,online}]。
+    // nodes_query：返回 [{id,name,online,created_at}]。created_at 默认按 id 派生
+    // 一个稳定值（同一 id 每次相同），需要模拟「id 被复用给另一台机器」的用例
+    // 用 `set_created_at` 覆盖它。
     linker
         .func_wrap("host", "nodes_query", |mut caller: Caller<'_, Host>, out_ptr: i32, out_cap: i32| -> i32 {
+            if let Some(code) = *caller.data().nodes_error.lock().unwrap() {
+                return code;
+            }
+            let overrides = caller.data().created_at.lock().unwrap().clone();
             let arr: Vec<serde_json::Value> = caller
                 .data()
                 .nodes
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(id, name, online)| serde_json::json!({"id": id, "name": name, "online": online}))
+                .map(|(id, name, online)| {
+                    serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "online": online,
+                        "created_at": overrides.get(id).copied().unwrap_or(DEFAULT_CREATED_AT + id),
+                    })
+                })
                 .collect();
             let bytes = serde_json::to_vec(&arr).unwrap();
-            let n = bytes.len().min(out_cap.max(0) as usize);
+            // 与真宿主一致：放不下报 -6，不截断（截断的 JSON 在插件侧会让
+            // 查询"成功"却拿到空列表，进而误删记录）。
+            if bytes.len() > out_cap.max(0) as usize {
+                return -6;
+            }
+            let n = bytes.len();
             if out_ptr > 0 && n > 0 && !write_mem(&mut caller, out_ptr, &bytes[..n]) {
                 return -1;
             }
@@ -237,6 +263,9 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
             "host",
             "data_list",
             |mut caller: Caller<'_, Host>, pp: i32, pl: i32, out_ptr: i32, out_cap: i32| -> i32 {
+                if let Some(code) = *caller.data().data_error.lock().unwrap() {
+                    return code;
+                }
                 let Some(prefix) = read_text(&mut caller, pp, pl) else { return -1 };
                 let mut rows: Vec<serde_json::Value> = caller
                     .data()
@@ -249,7 +278,13 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
                     .collect();
                 rows.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
                 let bytes = serde_json::to_vec(&rows).unwrap();
-                let n = bytes.len().min(out_cap.max(0) as usize);
+                // 与真宿主一致：放不下就报 -6（ERR_QUOTA），**不截断**——截断的
+                // JSON 在插件侧会退化成"空列表"，而空列表会让对账把记录全改写成
+                // 空白。桩必须能表达这条路径，插件才测得出来。
+                if bytes.len() > out_cap.max(0) as usize {
+                    return -6;
+                }
+                let n = bytes.len();
                 if out_ptr > 0 && n > 0 && !write_mem(&mut caller, out_ptr, &bytes[..n]) {
                     return -1;
                 }
@@ -268,21 +303,28 @@ fn call_unit(store: &mut Store<Host>, instance: &wasmtime::Instance, name: &str)
     f.call(&mut *store, ()).unwrap()
 }
 
-/// 调一个 (ptr,len)->i32 导出（render_page / on_action / on_cleanup），把输入
-/// 经 __alloc 写进内存，返回写回 resp 缓冲的 JSON 文本。
-fn call_json(store: &mut Store<Host>, instance: &wasmtime::Instance, name: &str, input: &str) -> String {
+/// 把 `input` 经 __alloc 写进插件内存，调一个 (ptr,len)->i32 导出，返回它的原始
+/// 返回码。
+fn call_export(store: &mut Store<Host>, instance: &wasmtime::Instance, name: &str, input: &str) -> i32 {
     let alloc = instance.get_typed_func::<(i32,), i32>(&mut *store, "__alloc").unwrap();
     let f = instance.get_typed_func::<(i32, i32), i32>(&mut *store, name).unwrap();
     let mem: Memory = instance.get_memory(&mut *store, "memory").unwrap();
     let bytes = input.as_bytes();
     let ptr = alloc.call(&mut *store, (bytes.len().max(1) as i32,)).unwrap();
     mem.data_mut(&mut *store)[ptr as usize..ptr as usize + bytes.len()].copy_from_slice(bytes);
-    let n = f.call(&mut *store, (ptr, bytes.len() as i32)).unwrap();
+    f.call(&mut *store, (ptr, bytes.len() as i32)).unwrap()
+}
+
+/// 调一个 (ptr,len)->i32 导出（render_page / on_action），返回写回 resp 缓冲的
+/// JSON 文本。
+fn call_json(store: &mut Store<Host>, instance: &wasmtime::Instance, name: &str, input: &str) -> String {
+    let n = call_export(store, instance, name, input);
     assert!(n >= 0, "{name} 返回错误码 {n}");
     // 响应写在插件最近一次 resp_alloc 记下的缓冲里（与生产宿主同约定）。
     let (resp_ptr, resp_cap) = *store.data().resp.lock().unwrap();
     assert!(resp_ptr > 0, "{name} 未调用 resp_alloc");
     let len = (n as usize).min(resp_cap.max(0) as usize);
+    let mem: Memory = instance.get_memory(&mut *store, "memory").unwrap();
     let data = mem.data(&*store);
     String::from_utf8_lossy(&data[resp_ptr as usize..resp_ptr as usize + len]).into_owned()
 }
@@ -341,12 +383,54 @@ fn seed(store: &Store<Host>, key: &str, value: &str) {
     store.data().data.lock().unwrap().insert(key.to_owned(), value.to_owned());
 }
 
+/// 覆盖某个 id 的 `created_at`——模拟「该 id 已被复用给另一台机器」。
+fn set_created_at(store: &Store<Host>, id: i64, created_at: i64) {
+    store.data().created_at.lock().unwrap().insert(id, created_at);
+}
+
+/// 声明宿主那边的节点表：对账要求插件里的记录与宿主节点一一对应，
+/// 宿主没有的 id 会被当成「节点已删除」清掉，所以塞节点记录的用例都要先声明。
+fn declare_host_nodes(host: &Host, nodes: &[(i64, &str)]) {
+    host.nodes.lock().unwrap().extend(nodes.iter().map(|(id, name)| (*id, (*name).to_owned(), false)));
+}
+
+/// 把一条事件 JSON 派给插件的 `on_event`（它不写 resp 缓冲，返回值恒为 0）。
+fn dispatch_event(store: &mut Store<Host>, instance: &wasmtime::Instance, json: &str) {
+    assert_eq!(call_export(store, instance, "on_event", json), 0, "on_event 应返回 0");
+}
+
+/// 宿主发的 `node_added` 事件载荷（字段名与宿主 `Event::NodeAdded` 的序列化一致）。
+fn node_added_event(id: i64, name: &str, created_at: i64) -> String {
+    serde_json::json!({"type": "node_added", "node_id": id, "name": name, "created_at": created_at})
+        .to_string()
+}
+
+/// 宿主发的 `node_deleted` 事件载荷。
+fn node_deleted_event(id: i64, created_at: i64) -> String {
+    serde_json::json!({"type": "node_deleted", "node_id": id, "created_at": created_at}).to_string()
+}
+
 fn node_record(name: &str, price: f64, currency: &str, cycle: &str, expires: Option<&str>) -> String {
     serde_json::json!({
         "name": name, "price": price, "currency": currency,
         "billing_cycle": cycle, "expires_at": expires, "purchased_at": null,
     })
     .to_string()
+}
+
+/// 带宿主身份的节点记录（`host_created_at` 已填）——与宿主当前节点表相符的那种。
+fn node_record_owned(
+    name: &str,
+    price: f64,
+    currency: &str,
+    cycle: &str,
+    expires: Option<&str>,
+    created_at: i64,
+) -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&node_record(name, price, currency, cycle, expires)).unwrap();
+    v["host_created_at"] = serde_json::json!(created_at);
+    v.to_string()
 }
 
 /// 页面里的 form 块。
@@ -429,9 +513,9 @@ fn toast_of(resp: &serde_json::Value) -> (String, String) {
 // 测试
 // ---------------------------------------------------------------------------
 
-/// 首次 tick 导入所有节点记录；再次 tick 不重复导入（幂等）。
+/// 每轮 tick 都与宿主节点表对账：缺记录的补建，已有记录（操作员填的价格）不被覆盖。
 #[test]
-fn tick_imports_nodes_once() {
+fn tick_reconciles_nodes_without_overwriting_edits() {
     let engine = engine();
     let wasm = build_wasm();
     let host = Host::default();
@@ -441,18 +525,47 @@ fn tick_imports_nodes_once() {
 
     tick(&mut store, &instance);
     let data = store.data().data.lock().unwrap().clone();
-    assert!(data.contains_key("node:1"), "导入应建 node:1");
+    assert!(data.contains_key("node:1"), "对账应建 node:1");
     assert!(data.contains_key("node:2"));
     assert!(data.contains_key("fx"), "汇率缓存已写");
-    // 导入的是空白记录：价格 0、周期默认年付。
-    let imported: serde_json::Value = serde_json::from_str(&data["node:1"]).unwrap();
-    assert_eq!(imported["price"], 0.0, "导入的记录价格从 0 起：{imported}");
-    assert_eq!(imported["billing_cycle"], "yearly", "导入的默认周期是年付：{imported}");
+    // 建的是空白记录：价格 0、周期默认年付，并带上宿主身份。
+    let created: serde_json::Value = serde_json::from_str(&data["node:1"]).unwrap();
+    assert_eq!(created["price"], 0.0, "对账建出的记录价格从 0 起：{created}");
+    assert_eq!(created["billing_cycle"], "yearly", "默认周期是年付：{created}");
+    assert_eq!(created["host_created_at"], DEFAULT_CREATED_AT + 1, "记录要带上宿主身份：{created}");
 
-    // 手工改一条，再 tick 不应被覆盖（imported 标志生效）。
+    // 手工改一条，再 tick 不应被覆盖。
     seed(&store, "node:1", &node_record("edge-1", 42.0, "USD", "monthly", None));
     tick(&mut store, &instance);
-    assert!(store.data().data.lock().unwrap()["node:1"].contains("42"), "二次 tick 不重导入");
+    assert!(store.data().data.lock().unwrap()["node:1"].contains("42"), "对账不覆盖已有记录");
+}
+
+/// 启用后新加的节点：下一轮 tick 要补建财务记录，页面也要列出它，
+/// 同时已有的（可能已被编辑过的）记录不能被覆盖。
+#[test]
+fn nodes_added_after_first_sync_get_records_and_show_on_page() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((1, "edge-1".into(), true));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+
+    tick(&mut store, &instance); // 首轮：建出 node:1
+    seed(&store, "node:1", &node_record("edge-1", 42.0, "USD", "monthly", None));
+
+    // hub 上新增一台机器
+    store.data().nodes.lock().unwrap().push((2, "edge-2".into(), false));
+
+    tick(&mut store, &instance);
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(data.contains_key("node:2"), "新增节点应补建财务记录：{data:?}");
+    assert!(data["node:1"].contains("42"), "已有记录不能被对账覆盖");
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "")).unwrap();
+    let rows = form_block(&page)["rows"].as_array().unwrap();
+    assert!(rows.iter().any(|r| r["id"] == 2), "新增节点应出现在编辑表：{rows:?}");
 }
 
 /// Covers AE4：到期已过但在线的节点，日期向后滚动、不发事件。
@@ -467,7 +580,7 @@ fn overdue_online_node_rolls_forward() {
 
     let past = (today() - chrono::Duration::days(1)).to_string();
     seed(&store, "node:1", &node_record("edge-1", 10.0, "USD", "monthly", Some(&past)));
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let emitted = tick(&mut store, &instance);
     assert!(emitted.is_empty(), "滚动的节点不发提醒");
@@ -487,7 +600,7 @@ fn threshold_node_emits_event() {
 
     let soon = (today() + chrono::Duration::days(7)).to_string();
     seed(&store, "node:7", &node_record("edge-7", 10.0, "USD", "monthly", Some(&soon)));
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     tick(&mut store, &instance);
     let events = store.data().emitted.lock().unwrap().clone();
@@ -509,7 +622,7 @@ fn page_warns_when_fx_unavailable() {
     let host = Host::default();
     // http_body 保持 None：拉取失败。 // 拉取失败
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     call_unit(&mut store, &instance, "on_tick"); // 尝试拉，失败
     let page = call_json(&mut store, &instance, "render_page", "{}");
@@ -530,8 +643,9 @@ fn render_page_fetches_fx_when_cache_missing() {
     let wasm = build_wasm();
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "paid")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "node:1", &node_record("paid", 10.0, "USD", "monthly", None));
 
     let page: serde_json::Value =
@@ -560,7 +674,7 @@ fn render_page_warns_with_failure_reason_when_fetch_fails() {
     let wasm = build_wasm();
     let host = Host::default(); // http_body 保持 None → 桩宿主返回 -4
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
@@ -582,7 +696,7 @@ fn render_page_does_not_fetch_when_cache_present() {
     let wasm = build_wasm();
     let host = Host::default(); // 拉的话会失败：计数为 0 才说明根本没试
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "fx", &fx_record("CNY", NOW - 86_400));
 
     let page: serde_json::Value =
@@ -603,7 +717,7 @@ fn cached_page_appends_last_refresh_failure() {
     let wasm = build_wasm();
     let host = Host::default();
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "fx", &fx_record("CNY", NOW - 7_200));
     seed(&store, "fx_status", &fx_status_record("网络请求失败或超时", NOW));
 
@@ -634,7 +748,7 @@ fn junk_fx_status_does_not_break_the_page() {
     for junk in ["{半截的 JSON", r#"{"reason":123,"attempted_at":"昨天"}"#] {
         let host = Host::default();
         let (mut store, instance) = instantiate(&engine, &wasm, host);
-        seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+        seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
         seed(&store, "fx", &fx_record("CNY", NOW - 3_600));
         seed(&store, "fx_status", junk);
 
@@ -660,7 +774,7 @@ fn render_page_carries_no_toast() {
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
@@ -677,7 +791,7 @@ fn unknown_action_returns_plain_page_without_toast() {
     let wasm = build_wasm();
     let host = Host::default(); // http_body 保持 None：拉了会失败
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let resp: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "on_action", r#"{"action":"nope"}"#))
@@ -696,8 +810,9 @@ fn save_node_action_does_not_fetch_fx() {
     let engine = engine();
     let wasm = build_wasm();
     let host = Host::default(); // 拉了会失败，正好用计数断言"没拉"
+    declare_host_nodes(&host, &[(1, "edge-1")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "node:1", &node_record("edge-1", 10.0, "USD", "monthly", None));
 
     let resp: serde_json::Value = serde_json::from_str(&call_json(
@@ -727,7 +842,7 @@ fn successful_refresh_clears_failure_status() {
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "fx_status", &fx_status_record("网络请求失败或超时", NOW - 3_600));
 
     let resp: serde_json::Value = serde_json::from_str(&call_json(
@@ -759,7 +874,7 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
     // 网络失败（http 负错误码 -4）：tick 也要记。
     let host = Host::default();
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     tick(&mut store, &instance);
     let st: serde_json::Value =
         serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
@@ -770,7 +885,7 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
     let host = Host::default();
     host.http_body.lock().unwrap().replace("<html>502</html>".into());
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     tick(&mut store, &instance);
     let st: serde_json::Value =
         serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
@@ -781,7 +896,7 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
     let host = Host::default();
     host.http_body.lock().unwrap().replace(r#"{"amount":1.0,"base":"CNY"}"#.into());
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     tick(&mut store, &instance);
     let st: serde_json::Value =
         serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
@@ -795,7 +910,7 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
     let host = Host::default();
     *host.http_error.lock().unwrap() = Some(-5);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     tick(&mut store, &instance);
     let st: serde_json::Value =
         serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
@@ -809,7 +924,7 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
     let host = Host::default();
     *host.http_error.lock().unwrap() = Some(-7);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     tick(&mut store, &instance);
     let st: serde_json::Value =
         serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
@@ -822,7 +937,8 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
 /// 页面钩子的开销随机器数线性增长,而宿主给的预算是每次调用固定的(见仓库
 /// README「资源限制」的钩子那一档)。按那个预算跑一个真实规模的页面:一百台
 /// 机器的财务记录必须渲染得出来——超出预算的那次,生产里就是点页面回 502
-/// (实测 20 台约 150 万 fuel、100 台约 580 万)。
+/// （实测 100 台约 930 万；页面渲染里的对账要读一次宿主节点表，那是这份开销的
+/// 大头，再往上加机器时先看这里）。
 #[test]
 fn page_renders_within_the_production_fuel_budget() {
     /// 宿主的 `plugin.hook_fuel_limit` 默认值。真源是 monitor 仓
@@ -833,10 +949,13 @@ fn page_renders_within_the_production_fuel_budget() {
     let engine = engine();
     let wasm = build_wasm();
     let host = Host::default();
+    for i in 1..=100 {
+        host.nodes.lock().unwrap().push((i, format!("edge-{i}"), false));
+    }
     let (mut store, instance) = instantiate(&engine, &wasm, host);
     store.set_fuel(PROD_HOOK_FUEL).unwrap();
 
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     for i in 1..=100 {
         seed(
             &store,
@@ -863,9 +982,10 @@ fn page_totals_convert_and_skip_free() {
     let host = Host::default();
     // rates（base=CNY）：USD=0.14 → 1 USD = 1/0.14 CNY。
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "paid"), (2, "free")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
 
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "node:1", &node_record("paid", 10.0, "USD", "monthly", None));
     seed(&store, "node:2", &node_record("free", 0.0, "USD", "monthly", None));
 
@@ -887,9 +1007,10 @@ fn remaining_value_prorates_within_cycle() {
     let wasm = build_wasm();
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "edge"), (2, "freebie")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
 
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     // 月付 10 USD，30 天周期还剩 15 天 → 5 USD → /0.14 CNY。
     let in15 = (today() + chrono::Duration::days(15)).to_string();
     seed(&store, "node:1", &node_record("edge", 10.0, "USD", "monthly", Some(&in15)));
@@ -913,8 +1034,9 @@ fn unrecognised_billing_cycles_are_surfaced() {
     let wasm = build_wasm();
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "typo-a"), (2, "typo-b"), (3, "ok"), (4, "lifetime"), (5, "gratis")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "node:1", &node_record("typo-a", 10.0, "USD", "montly", None));
     seed(&store, "node:2", &node_record("typo-b", 10.0, "USD", "yearlyy", None));
     seed(&store, "node:3", &node_record("ok", 10.0, "USD", "monthly", None));
@@ -951,7 +1073,7 @@ fn set_currency_persists_and_recomputes() {
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let resp: serde_json::Value = serde_json::from_str(&call_json(
         &mut store,
@@ -972,8 +1094,9 @@ fn currency_symbols_follow_the_target_currency() {
     let wasm = build_wasm();
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "paid-usd"), (2, "paid-cny")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "node:1", &node_record("paid-usd", 10.0, "USD", "monthly", None));
     seed(&store, "node:2", &node_record("paid-cny", 10.0, "CNY", "yearly", None));
 
@@ -1007,23 +1130,240 @@ fn currency_symbols_follow_the_target_currency() {
     assert_eq!(rows[0]["price_symbol"], "$", "换展示币种不该动节点自己的币种：{rows:?}");
 }
 
-/// 清理：删掉已不在节点表里的残留记录，返回统计。
+/// 页面的行序必须是确定的：沿用宿主 `data_list` 的键序（`node:1`、`node:10`、
+/// `node:2`……字符串序），而不是 `HashMap` 的迭代序——后者每个实例都不一样，
+/// 同一份数据两次渲染就可能给出不同的行序。
 #[test]
-fn cleanup_prunes_deleted_nodes() {
+fn form_rows_keep_the_host_key_order() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let nodes: Vec<(i64, &str)> = (1..=12).map(|i| (i, "edge")).collect();
+    declare_host_nodes(&host, &nodes);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    for i in 1..=12 {
+        // node:3 故意不预置：它会在这次渲染里被对账建出来，行序仍须按记录键排，
+        // 不能先挂在末尾、下一次渲染再跳回中间。
+        if i != 3 {
+            seed(
+                &store,
+                &format!("node:{i}"),
+                &node_record(&format!("edge-{i}"), 1.0, "USD", "monthly", None),
+            );
+        }
+    }
+
+    let row_ids = |store: &mut Store<Host>| -> Vec<i64> {
+        let page: serde_json::Value =
+            serde_json::from_str(&call_json(store, &instance, "render_page", "{}")).unwrap();
+        form_block(&page)["rows"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect()
+    };
+    let first = row_ids(&mut store);
+    assert_eq!(
+        first,
+        vec![1, 10, 11, 12, 2, 3, 4, 5, 6, 7, 8, 9],
+        "行序应沿用宿主的键序（node:10 排在 node:2 之前）"
+    );
+    assert_eq!(row_ids(&mut store), first, "同一份数据两次渲染的行序必须一致");
+}
+
+/// 对账：宿主已不存在的节点，其记录随之删除；宿主仍有的不动。
+#[test]
+fn reconcile_prunes_records_of_deleted_nodes() {
     let engine = engine();
     let wasm = build_wasm();
     let host = Host::default();
     host.nodes.lock().unwrap().push((1, "kept".into(), true)); // 只保留 1
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
     let (mut store, instance) = instantiate(&engine, &wasm, host);
     seed(&store, "node:1", &node_record("kept", 1.0, "USD", "monthly", None));
     seed(&store, "node:99", &node_record("gone", 1.0, "USD", "monthly", None));
 
-    let out: serde_json::Value =
-        serde_json::from_str(&call_json(&mut store, &instance, "on_cleanup", "{}")).unwrap();
-    assert_eq!(out["pruned"], 1, "只清掉已删除的节点");
+    tick(&mut store, &instance);
     let data = store.data().data.lock().unwrap().clone();
-    assert!(data.contains_key("node:1"), "保留的节点不动");
-    assert!(!data.contains_key("node:99"), "已删除节点的记录被清");
+    assert!(data.contains_key("node:1"), "宿主还在的节点不动");
+    assert!(!data.contains_key("node:99"), "宿主已删除的节点记录被清");
+}
+
+/// 查不到宿主节点集合时一条都不能动：把它当成空集合会把所有记录删光。
+#[test]
+fn reconcile_keeps_everything_when_nodes_query_fails() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((1, "kept".into(), true));
+    host.nodes_error.lock().unwrap().replace(-8);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+    // 一台正落在提醒阈值上的机器：宿主读失败**只**该跳过滚动，提醒照发——它读的
+    // 全是插件自己的数据（expires_at + 阈值），按等级精确匹配一次，漏一轮就整个
+    // 计费周期都不会再响。
+    let soon = (today() + chrono::Duration::days(7)).to_string();
+    seed(&store, "node:1", &node_record("kept", 5.0, "USD", "monthly", Some(&soon)));
+    seed(&store, "node:99", &node_record("gone", 5.0, "USD", "monthly", None));
+
+    let emitted = tick(&mut store, &instance);
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(data.contains_key("node:1") && data.contains_key("node:99"), "查询失败时一条都不删");
+    assert_eq!(emitted, vec!["plugin_expiry_soon"], "宿主查询失败不该吞掉到期提醒");
+
+    // 页面渲染同样以对账兜底，失败路径也不能删。
+    let _ = call_json(&mut store, &instance, "render_page", "");
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(data.contains_key("node:99"), "渲染页面时的对账失败同样不删记录");
+}
+
+/// 插件自己的记录读不出来（超配额 / 数据库错）时**一条都不许改写**：把读失败当成
+/// 空集合会让对账把每一台机器都改写成空白记录，操作员填的价格全丢且无从恢复。
+#[test]
+fn an_unreadable_record_set_never_rewrites_records() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((1, "kept".into(), true));
+    host.data_error.lock().unwrap().replace(-6);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+    seed(&store, "node:1", &node_record("kept", 42.0, "USD", "monthly", None));
+
+    tick(&mut store, &instance);
+    let rec = store.data().data.lock().unwrap()["node:1"].clone();
+    assert!(rec.contains("42"), "读不到记录时不能改写它：{rec}");
+
+    // 页面也不能装作「一台机器都没有」：空表 + 一条说明。
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+    assert!(form_block(&page)["rows"].as_array().unwrap().is_empty(), "读不到就如实留空");
+    assert!(
+        notice_texts(&page).iter().any(|t| t.contains("读不到插件存的节点记录")),
+        "要说明为什么是空的：{:?}",
+        notice_texts(&page)
+    );
+    let rec = store.data().data.lock().unwrap()["node:1"].clone();
+    assert!(rec.contains("42"), "渲染路径同样不能改写记录：{rec}");
+}
+
+/// 事件派发用的是 `plugin.fuel_limit` 那一档（默认 1e6），比页面/tick 的钩子预算
+/// 小一个量级：`on_event` 超了这一档在生产里只会表现为一条 fuel_exhausted 记录，
+/// 所以这条按生产预算跑一遍。
+#[test]
+fn on_event_fits_the_production_event_fuel_budget() {
+    /// 宿主的 `plugin.fuel_limit` 默认值，真源见 monitor 仓 `src/plugin/host.rs`。
+    const PROD_EVENT_FUEL: u64 = 1_000_000;
+    let engine = engine();
+    let wasm = build_wasm();
+    let (mut store, instance) = instantiate(&engine, &wasm, Host::default());
+    store.set_fuel(PROD_EVENT_FUEL).unwrap();
+
+    dispatch_event(&mut store, &instance, &node_added_event(7, "edge-7", 1_700_000_007));
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert_eq!(rec["name"], "edge-7", "生产事件预算下也要跑完：{rec}");
+}
+
+/// 宿主新增节点的事件：实时建出空白记录，不必等下一轮 tick。
+#[test]
+fn node_added_event_creates_a_blank_record() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let (mut store, instance) = instantiate(&engine, &wasm, Host::default());
+
+    dispatch_event(&mut store, &instance, &node_added_event(7, "edge-7", 1_700_000_007));
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert_eq!(rec["name"], "edge-7");
+    assert_eq!(rec["price"], 0.0, "新建的是空白记录：{rec}");
+    assert_eq!(rec["billing_cycle"], "yearly");
+    assert_eq!(rec["host_created_at"], 1_700_000_007, "记录带上宿主身份：{rec}");
+}
+
+/// 同一台机器的事件迟到或重投时不能抹掉操作员已填的数据；身份不同（id 被复用）
+/// 才重置。
+#[test]
+fn a_late_duplicate_node_added_keeps_the_edited_record() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let (mut store, instance) = instantiate(&engine, &wasm, Host::default());
+    seed(&store, "node:7", &node_record_owned("edge-7", 42.0, "USD", "yearly", None, 1_700_000_007));
+
+    dispatch_event(&mut store, &instance, &node_added_event(7, "edge-7", 1_700_000_007));
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert_eq!(rec["price"], 42.0, "同一台机器的重投不改写记录：{rec}");
+
+    // id 被复用：身份变了，记录必须重置成新机器的空白记录。
+    dispatch_event(&mut store, &instance, &node_added_event(7, "edge-7-new", 1_700_000_999));
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert_eq!(rec["host_created_at"], 1_700_000_999);
+    assert_eq!(rec["name"], "edge-7-new");
+    assert_eq!(rec["price"], 0.0, "换了机器就不能继承旧价格：{rec}");
+}
+
+/// 宿主删除节点的事件：身份相符才删。
+#[test]
+fn node_deleted_event_removes_a_matching_record() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let (mut store, instance) = instantiate(&engine, &wasm, Host::default());
+    seed(&store, "node:7", &node_record_owned("edge-7", 10.0, "USD", "monthly", None, 1_700_000_007));
+
+    dispatch_event(&mut store, &instance, &node_deleted_event(7, 1_700_000_007));
+    assert!(!store.data().data.lock().unwrap().contains_key("node:7"), "身份相符即删");
+}
+
+/// 事件异步派发会乱序：id 已被复用给新机器时，迟到的旧删除事件不能删掉新记录。
+#[test]
+fn node_deleted_event_ignores_a_reused_id() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let (mut store, instance) = instantiate(&engine, &wasm, Host::default());
+    // 新机器（新身份）已经占了 id 7，记录是新节点的。
+    seed(&store, "node:7", &node_record_owned("edge-7-new", 42.0, "USD", "monthly", None, 1_700_000_999));
+
+    dispatch_event(&mut store, &instance, &node_deleted_event(7, 1_700_000_007)); // 旧机器的删除
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(data.contains_key("node:7"), "身份不符不能删：{data:?}");
+    assert!(data["node:7"].contains("42"), "新节点的记录原样保留");
+}
+
+/// id 被复用（宿主同一个 id 换了机器）：对账把记录重置成空白，不继承旧机器的价格。
+#[test]
+fn reconcile_resets_a_record_whose_host_identity_changed() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((7, "edge-7-new".into(), false));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    set_created_at(&store, 7, 1_700_000_999); // 宿主那边这个 id 现在属于新机器
+    seed(&store, "node:7", &node_record_owned("edge-7-old", 42.0, "USD", "yearly", None, 1_700_000_007));
+
+    tick(&mut store, &instance);
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert_eq!(rec["host_created_at"], 1_700_000_999, "身份换成新机器的：{rec}");
+    assert_eq!(rec["name"], "edge-7-new");
+    assert_eq!(rec["price"], 0.0, "旧机器的价格不能继承：{rec}");
+}
+
+/// 升级前留下的记录没有身份字段：对账只采纳宿主的身份，绝不动操作员填的价格。
+#[test]
+fn reconcile_adopts_host_identity_for_legacy_records() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.nodes.lock().unwrap().push((7, "edge-7".into(), false));
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "node:7", &node_record("edge-7", 42.0, "USD", "yearly", None));
+
+    tick(&mut store, &instance);
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:7"]).unwrap();
+    assert_eq!(rec["price"], 42.0, "采纳身份不能碰价格：{rec}");
+    assert_eq!(rec["host_created_at"], DEFAULT_CREATED_AT + 7, "身份采纳为宿主当前值：{rec}");
 }
 
 /// Covers AE1（R1/R2）：form 字段是新式对象声明，列头为中文，币种与周期是
@@ -1034,7 +1374,7 @@ fn form_fields_declare_labels_and_select_options() {
     let wasm = build_wasm();
     let host = Host::default();
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
@@ -1124,8 +1464,9 @@ fn save_node_toasts_and_persists() {
     let host = Host::default();
     // rates（base=CNY）：EUR=0.13 → 1 EUR = 1/0.13 CNY。
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "edge-1")]);
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "node:1", &node_record("edge-1", 10.0, "USD", "monthly", None));
     call_unit(&mut store, &instance, "on_tick"); // 先把汇率缓存灌进去，页面才有统计块
 
@@ -1163,7 +1504,7 @@ fn save_node_without_record_toasts_error() {
     let wasm = build_wasm();
     let host = Host::default();
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let resp: serde_json::Value = serde_json::from_str(&call_json(
         &mut store,
@@ -1188,7 +1529,7 @@ fn save_node_without_id_toasts_error() {
     let wasm = build_wasm();
     let host = Host::default(); // 拉了会失败：计数为 0 才说明没拉
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
 
     let resp: serde_json::Value = serde_json::from_str(&call_json(
         &mut store,
@@ -1219,7 +1560,7 @@ fn refresh_fx_toasts_success_and_failure() {
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     let ok: serde_json::Value = serde_json::from_str(&call_json(
         &mut store,
         &instance,
@@ -1233,7 +1574,7 @@ fn refresh_fx_toasts_success_and_failure() {
     // 失败：http 返回错误码（桩宿主 -4），缓存不写、提示为失败。
     let host = Host::default(); // http_body 保持 None
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     let bad: serde_json::Value = serde_json::from_str(&call_json(
         &mut store,
         &instance,
@@ -1266,7 +1607,7 @@ fn refresh_fx_failure_toast_mentions_cache_and_reason() {
     let wasm = build_wasm();
     let host = Host::default(); // http_body 保持 None → 拉取失败
     let (mut store, instance) = instantiate(&engine, &wasm, host);
-    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
     seed(&store, "fx", &fx_record("CNY", NOW - 86_400));
 
     let resp: serde_json::Value = serde_json::from_str(&call_json(
@@ -1288,3 +1629,4 @@ fn refresh_fx_failure_toast_mentions_cache_and_reason() {
     // 旧缓存仍在，统计照旧有依据。
     assert_eq!(store.data().data.lock().unwrap()["fx"], fx_record("CNY", NOW - 86_400));
 }
+

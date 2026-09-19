@@ -4,24 +4,26 @@
 //!
 //! - 自持全部节点财务数据（价格 / 币种 / 计费周期 / 到期日），存在自己的
 //!   `plugin_data` 命名空间里（宿主 node 表不再有这些列）；
-//! - 首次运行时经 `nodes_query` 把宿主历史数据导入（一次性、幂等）；
+//! - 与宿主节点表**对账**（每轮 tick、每次打开页面各一次）：补建缺的记录、
+//!   删掉宿主已不存在的记录、按 `(id, created_at)` 认出 id 被复用而重置那条
+//!   记录；拿不到宿主节点集合时一条都不动；
+//! - 订阅宿主事件 `node_added` / `node_deleted`，启用期间新增与删除实时同步；
 //! - 每小时 tick：用 `http_get` 从 Frankfurter 拉汇率并缓存，再扫描到期日
 //!   （到期的在线节点按周期向后滚动；进入阈值窗口的经 `emit_event` 发
 //!   `plugin_expiry_soon`）；
 //! - `render_page` 渲染统计页（年化续费成本 / 剩余价值 / 到期列表 / 编辑表）；
 //!   首次渲染时若尚无汇率缓存，先同步拉一次（R4/KTD3）；
 //! - `on_action` 处理页面交互（切币种 / 保存节点 / 立即刷新汇率）——其余动作
-//!   路径不**隐式**拉取（切币种与手动刷新各自显式拉一次）；
-//! - `on_cleanup` 清掉已删除节点的残留记录。
+//!   路径不**隐式**拉取（切币种与手动刷新各自显式拉一次）。
 //!
 //! # 数据模型（plugin_data 的记录）
 //!
 //! | key | value |
 //! |-----|-------|
-//! | `config` | `{target_currency, threshold_days, imported}` |
+//! | `config` | `{target_currency, threshold_days}` |
 //! | `fx` | `{base, rates: {CUR: number}, fetched_at}` |
 //! | `fx_status` | `{reason, attempted_at}`——最近一次拉取失败的原因与时间；成功即删（R5/KTD4） |
-//! | `node:<id>` | `{name, price, currency, billing_cycle, expires_at, purchased_at}` |
+//! | `node:<id>` | `{name, price, currency, billing_cycle, expires_at, purchased_at, host_created_at}` |
 //!
 //! 时间一律向宿主要（`host_now`），日期算术交给 chrono 的 NaiveDate。
 //! 时区用 UTC——与面板展示的本地日期可能差一天，这是已知取舍（宿主原 Logic
@@ -139,19 +141,30 @@ fn data_delete(key: &str) {
     unsafe { host_data_delete(kp, kl) };
 }
 
-/// 列出 `prefix` 前缀的全部记录，返回 (key, data) 列表。
-fn data_list(prefix: &str) -> Vec<(String, String)> {
+/// `data_list` 回的一行。
+#[derive(Deserialize)]
+struct DataRow {
+    key: String,
+    data: String,
+}
+
+/// 列出 `prefix` 前缀的全部记录，返回 (key, data) 列表。宿主读回的字节写进调用
+/// 方给的 `buf`：分配并清零 256 KiB 是这个插件最贵的一笔 fuel，一次调用里的几处
+/// 宿主读先后使用同一块（读回的内容当场解析成 owned 数据，缓冲不再需要）。
+///
+/// `None` 表示**这次读没成功**（负错误码=超配额或数据库错、解析失败），与「一条
+/// 记录都没有」（`Some(空)`）必须分开：对账拿它做写操作，把读失败当成空集合会把
+/// 每一台机器的记录都改写成空白记录，价格全丢且无从恢复。宿主侧同一纪律见
+/// [`host_nodes`]。
+fn data_list(prefix: &str, buf: &mut [u8]) -> Option<Vec<(String, String)>> {
     let (pp, pl) = write_str(prefix);
-    let mut buf = vec![0u8; BUF];
     let n = unsafe { host_data_list(pp, pl, buf.as_mut_ptr() as i32, buf.len() as i32) };
     if n <= 0 {
-        return Vec::new();
+        return None;
     }
     let text = bytes_to_string(&buf[..n as usize]);
-    let rows: Vec<Value> = serde_json::from_str(&text).unwrap_or_default();
-    rows.into_iter()
-        .filter_map(|r| Some((r.get("key")?.as_str()?.to_owned(), r.get("data")?.as_str()?.to_owned())))
-        .collect()
+    let rows: Vec<DataRow> = serde_json::from_str(&text).ok()?;
+    Some(rows.into_iter().map(|r| (r.key, r.data)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +181,15 @@ struct NodeFin {
     /// 一次性付费机器的购买日，用于剩余价值折算（周期机器不读）。
     #[serde(default)]
     purchased_at: Option<String>,
+    /// 这条记录属于哪一台机器：建立时宿主 node 行的 `created_at`。宿主 id 会被
+    /// SQLite 复用（删掉最大 id 的节点后新建的节点会拿到同一个 id），所以
+    /// `node:<id>` 这个键本身认不出机器——值里的这一份才是身份：与宿主当前值
+    /// 不一致就说明该 id 已属于另一台机器，记录必须重置。
+    ///
+    /// 升级前留下的记录没有这个字段（`None`），首次对账只采纳宿主当前值，
+    /// 不重置——里面可能是操作员已经填好的价格。
+    #[serde(default)]
+    host_created_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,8 +213,6 @@ struct Config {
     target_currency: String,
     #[serde(default = "default_threshold")]
     threshold_days: i64,
-    #[serde(default)]
-    imported: bool,
 }
 
 fn default_target() -> String {
@@ -207,7 +227,6 @@ impl Config {
         data_get("config").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| Config {
             target_currency: default_target(),
             threshold_days: default_threshold(),
-            imported: false,
         })
     }
     fn save(&self) {
@@ -274,85 +293,142 @@ fn save_node(id: i64, n: &NodeFin) {
     }
 }
 
-fn all_nodes() -> Vec<(i64, NodeFin)> {
-    data_list("node:")
-        .into_iter()
-        .filter_map(|(key, data)| {
-            let id = key.strip_prefix("node:")?.parse::<i64>().ok()?;
-            let n = serde_json::from_str::<NodeFin>(&data).ok()?;
-            Some((id, n))
-        })
-        .collect()
+/// 插件自己存的全部节点记录。`None` = 这次没读成功（见 [`data_list`]）：调用方
+/// 必须把它当成「这轮拿不到数据」，绝不能当空集合。
+fn all_nodes(buf: &mut [u8]) -> Option<Vec<(i64, NodeFin)>> {
+    let rows = data_list("node:", buf)?;
+    Some(
+        rows.into_iter()
+            .filter_map(|(key, data)| {
+                let id = key.strip_prefix("node:")?.parse::<i64>().ok()?;
+                let n = serde_json::from_str::<NodeFin>(&data).ok()?;
+                Some((id, n))
+            })
+            .collect(),
+    )
 }
 
-fn online_nodes() -> Vec<i64> {
-    let mut buf = vec![0u8; BUF];
-    let n = unsafe { host_nodes_query(buf.as_mut_ptr() as i32, buf.len() as i32) };
-    if n <= 0 {
-        return Vec::new();
-    }
-    let arr: Vec<Value> = serde_json::from_str(&bytes_to_string(&buf[..n as usize])).unwrap_or_default();
-    arr.into_iter()
-        .filter(|v| v.get("online").and_then(|o| o.as_bool()).unwrap_or(false))
-        .filter_map(|v| v.get("id").and_then(|i| i.as_i64()))
-        .collect()
+/// 宿主节点表的一份快照项，也是 `nodes_query` 应答体的元素。用定长结构体而不是
+/// `serde_json::Value`：后者每个对象都是一棵 BTreeMap，百台机器量级下白付一大笔
+/// 解析 fuel。
+#[derive(Deserialize)]
+struct HostNode {
+    id: i64,
+    name: String,
+    #[serde(default)]
+    online: bool,
+    /// 宿主 node 行的 `created_at`，机器身份的另一半（见 [`NodeFin::host_created_at`]）。
+    /// `None` = 宿主没回这个字段，此时不比对身份，只补缺。
+    #[serde(default)]
+    created_at: Option<i64>,
 }
 
-// ---------------------------------------------------------------------------
-// 导入（KTD10：一次性、幂等）
-// ---------------------------------------------------------------------------
-
-/// 首次运行时经 nodes_query 读节点、建初始财务记录。宿主 node 表已不再有
-/// 财务列，所以导入只建「空财务记录」（price=0、币种默认 USD、周期默认年付、
-/// 无到期日）——有历史数据的部署在升级前由宿主导出，这里只保证每台机器都有
-/// 记录可编辑。幂等：config.imported 为真即跳过。
-fn ensure_imported(cfg: &mut Config) {
-    if cfg.imported {
-        return;
-    }
-    let known: std::collections::HashSet<i64> = all_nodes().into_iter().map(|(id, _)| id).collect();
-    // 查询失败就这次不做也不标记——标记了等于永久放弃导入,下一轮 tick 会重试。
-    let Some(nodes) = nodes_basic() else {
-        log(2, "finance-stats: nodes_query 失败,本轮跳过导入");
-        return;
-    };
-    for (id, name) in nodes {
-        if known.contains(&id) {
-            continue;
-        }
-        save_node(
-            id,
-            &NodeFin {
-                name,
-                price: 0.0,
-                currency: "USD".into(),
-                billing_cycle: "yearly".into(),
-                expires_at: None,
-                purchased_at: Some(today().to_string()),
-            },
-        );
-    }
-    cfg.imported = true;
-    cfg.save();
-}
-
-/// 节点的 (id, name)。供导入建记录与清理对账。
+/// 读宿主节点表。`None` 表示**查询失败**（负错误码，含结果放不下），与「确实没有
+/// 节点」（`Some(空)`）必须分开：对账拿不到存活集合时若把它当成空集合，会把所有
+/// 节点的记录全删掉；到期扫描同理，不知道谁在线就不该滚动任何日期。
 ///
-/// `None` 表示**宿主查询失败**(负错误码,含结果放不下),与"确实没有节点"
-/// (`Some(空)`)必须分开:清理拿不到存活集合时若把它当成空集合,会把所有
-/// 节点记录全删掉。导入同理——失败时不能标记"已导入",否则再也补不回来。
-fn nodes_basic() -> Option<Vec<(i64, String)>> {
-    let mut buf = vec![0u8; BUF];
+/// 读回的字节写进调用方给的 `buf`，理由见 [`data_list`]。
+fn host_nodes(buf: &mut [u8]) -> Option<Vec<HostNode>> {
     let n = unsafe { host_nodes_query(buf.as_mut_ptr() as i32, buf.len() as i32) };
     if n < 0 {
         return None;
     }
-    let arr: Vec<Value> = serde_json::from_str(&bytes_to_string(&buf[..n as usize])).unwrap_or_default();
-    Some(
-        arr.into_iter()
-            .filter_map(|v| Some((v.get("id")?.as_i64()?, v.get("name")?.as_str()?.to_owned())))
-            .collect(),
-    )
+    Some(serde_json::from_str(&bytes_to_string(&buf[..n as usize])).unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// 与宿主节点表对账（KTD10：从「一次性导入」演进为持续对账）
+// ---------------------------------------------------------------------------
+
+/// 空白财务记录：宿主刚建好的节点，或 id 被复用后属于新机器的那条记录。
+fn blank_node(name: String, created_at: Option<i64>) -> NodeFin {
+    NodeFin {
+        name,
+        price: 0.0,
+        currency: "USD".into(),
+        billing_cycle: "yearly".into(),
+        expires_at: None,
+        purchased_at: Some(today().to_string()),
+        host_created_at: created_at,
+    }
+}
+
+/// 把插件里存的节点记录按 `host` 这份宿主快照对齐，并返回对齐后的记录集合
+/// （调用方拿它直接算统计，不必再读一遍 `plugin_data`——每次读都要按节点量级
+/// 分配缓冲，而那是这个插件最贵的一笔 fuel 开销）：
+///
+/// - 宿主有、插件无 → 建空白记录；
+/// - 身份相符 → 不动（价格与到期日是操作员填的，对账绝不覆盖）；
+/// - 记录缺身份（升级前留下的）→ 采纳宿主当前值，不重置；
+/// - 身份不符 → 同一个 id 已被 SQLite 复用给另一台机器，重置为空白记录；
+/// - 宿主已无这个 id → 删掉记录。
+///
+/// 返回顺序按记录键排（与宿主 `data_list` 的 `ORDER BY record_key` 同序，如
+/// `node:1`、`node:10`、`node:2`）：页面行序与统计口径都建立在这个顺序上。这一轮
+/// 新建的记录并进同一份排序，不会先挂在末尾、下次渲染再跳回中间；`HashMap` 的
+/// 迭代序每个实例都不一样，不能拿来当输出顺序。
+fn reconcile_with(host: &[HostNode], known: Vec<(i64, NodeFin)>) -> Vec<(i64, NodeFin)> {
+    let mut by_id: HashMap<i64, NodeFin> = known.into_iter().collect();
+    let mut live: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for h in host {
+        live.insert(h.id);
+        match by_id.get(&h.id) {
+            None => {
+                let blank = blank_node(h.name.clone(), h.created_at);
+                save_node(h.id, &blank);
+                by_id.insert(h.id, blank);
+            }
+            Some(record) => {
+                // 宿主没回身份就不猜：留着记录，等宿主升级后下一轮再比。
+                let Some(created_at) = h.created_at else { continue };
+                match record.host_created_at {
+                    None => {
+                        let mut adopted = record.clone();
+                        adopted.host_created_at = Some(created_at);
+                        save_node(h.id, &adopted);
+                        by_id.insert(h.id, adopted);
+                    }
+                    Some(stored) if stored != created_at => {
+                        let blank = blank_node(h.name.clone(), Some(created_at));
+                        save_node(h.id, &blank);
+                        by_id.insert(h.id, blank);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    let stale: Vec<i64> = by_id.keys().copied().filter(|id| !live.contains(id)).collect();
+    for id in stale {
+        data_delete(&node_key(id));
+        by_id.remove(&id);
+    }
+    // 按记录键排序输出：与宿主 `ORDER BY record_key` 同序，本轮新建的记录也在
+    // 同一份排序里（`sort_by_cached_key` 每条只算一次键）。
+    let mut out: Vec<(i64, NodeFin)> = by_id.into_iter().collect();
+    out.sort_by_cached_key(|(id, _)| node_key(*id));
+    out
+}
+
+/// 读插件自己的记录与宿主节点表并对账，返回对账后的记录集合。两种读失败的处理
+/// 不同：
+///
+/// - 插件自己的记录读不出来 → `None`：这轮**什么都不能写**（把读失败当成空集合
+///   会把每台机器都改写成空白记录），调用方按「拿不到数据」处理；
+/// - 宿主节点表读不出来 → 原样返回已有记录、不做增删改（见 [`host_nodes`]）。
+fn reconcile() -> Option<Vec<(i64, NodeFin)>> {
+    let mut buf = vec![0u8; BUF];
+    let Some(known) = all_nodes(&mut buf) else {
+        log(3, "finance-stats: 读插件记录失败,本轮跳过对账");
+        return None;
+    };
+    match host_nodes(&mut buf) {
+        Some(host) => Some(reconcile_with(&host, known)),
+        None => {
+            log(2, "finance-stats: nodes_query 失败,本轮跳过节点对账");
+            Some(known)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,14 +591,14 @@ fn remaining_value(n: &NodeFin, today: NaiveDate) -> Option<f64> {
 
 /// 汇总：返回 (年化总成本, 剩余总价值) 在目标币种下的值；任一节点缺汇率
 /// 则该项跳过。fx 为 None 时返回 None（汇率不可用）。
-fn totals(fx: Option<&Fx>, today: NaiveDate) -> Option<((f64, f64), Vec<String>)> {
+fn totals(fx: Option<&Fx>, nodes: &[(i64, NodeFin)], today: NaiveDate) -> Option<((f64, f64), Vec<String>)> {
     let fx = fx?;
     let mut annual = 0.0;
     let mut remaining = 0.0;
     // 任一节点缺汇率则该项跳过；列出被跳过的币种让面板提示用户。
     let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (_, n) in all_nodes() {
-        if let Some(c) = annual_cost(&n) {
+    for (_, n) in nodes {
+        if let Some(c) = annual_cost(n) {
             match convert(fx, c, &n.currency) {
                 Some(v) => annual += v,
                 None => {
@@ -530,7 +606,7 @@ fn totals(fx: Option<&Fx>, today: NaiveDate) -> Option<((f64, f64), Vec<String>)
                 }
             }
         }
-        if let Some(r) = remaining_value(&n, today) {
+        if let Some(r) = remaining_value(n, today) {
             match convert(fx, r, &n.currency) {
                 Some(v) => remaining += v,
                 None => {
@@ -572,16 +648,35 @@ fn roll_if_online(id: i64, n: &mut NodeFin, online: &[i64], today: NaiveDate) ->
     true
 }
 
-/// 一拍的全部周期工作：导入（幂等）→ 刷新汇率 → 扫描到期。
+/// 一拍的全部周期工作：刷新汇率 → 对账 → 扫描到期。
 fn tick() {
-    let mut cfg = Config::load();
-    ensure_imported(&mut cfg);
+    let cfg = Config::load();
     if refresh_fx(&cfg) {
         log(1, "finance-stats: 汇率已更新");
     }
     let today = today();
-    let online = online_nodes();
-    for (id, mut n) in all_nodes() {
+    // 一次 nodes_query 同时供对账（谁存在）与到期扫描（谁在线）使用；对账返回的那
+    // 一份记录接着用来扫描，不再读第二遍 plugin_data。
+    let mut buf = vec![0u8; BUF];
+    // 自己那份记录读不出来：对账与扫描都要它，整轮不动。
+    let Some(known) = all_nodes(&mut buf) else {
+        log(3, "finance-stats: 读插件记录失败,本轮跳过对账与到期扫描");
+        return;
+    };
+    let (nodes, online) = match host_nodes(&mut buf) {
+        Some(host) => {
+            let online: Vec<i64> = host.iter().filter(|n| n.online).map(|n| n.id).collect();
+            (reconcile_with(&host, known), online)
+        }
+        None => {
+            // 拿不到在线集合只影响**滚动**：到期提醒读的全是插件自己的数据
+            // （expires_at 与阈值），照常发——它按等级精确匹配一次，漏一轮就整个
+            // 计费周期都不会再响。
+            log(2, "finance-stats: nodes_query 失败,本轮跳过到期滚动");
+            (known, Vec::new())
+        }
+    };
+    for (id, mut n) in nodes {
         if roll_if_online(id, &mut n, &online, today) {
             log(1, &format!("finance-stats: 节点 {} 到期日滚动到 {:?}", n.name, n.expires_at));
             save_node(id, &n);
@@ -680,11 +775,11 @@ fn cycle_options() -> Vec<Value> {
 /// 存下来但统计认不出的计费周期（历史数据里的拼写错误等），去重后按字典序
 /// 返回。`cycle_months` 认不出就返回 None，那台机器会被静默剔出年化成本——
 /// 列出来让操作员看得见。（`once` 与 `free` 是认得出的，不算。）
-fn unrecognised_cycles() -> Vec<String> {
+fn unrecognised_cycles(nodes: &[(i64, NodeFin)]) -> Vec<String> {
     let mut bad: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (_, n) in all_nodes() {
+    for (_, n) in nodes {
         if n.billing_cycle != ONCE && n.billing_cycle != FREE && cycle_months(&n.billing_cycle).is_none() {
-            bad.insert(n.billing_cycle);
+            bad.insert(n.billing_cycle.clone());
         }
     }
     bad.into_iter().collect()
@@ -699,8 +794,15 @@ fn with_toast(mut page: Value, kind: &str, text: &str) -> Value {
 }
 
 fn build_page(allow_fetch: bool) -> Value {
-    let mut cfg = Config::load();
-    ensure_imported(&mut cfg);
+    let cfg = Config::load();
+    // 对账后的那一份记录同时供统计与两张表使用：每读一次 plugin_data 都要按
+    // 节点量级分配缓冲，那是这个插件最贵的 fuel 开销，一次调用只读一次。
+    let (nodes, unreadable) = match reconcile() {
+        Some(nodes) => (nodes, false),
+        // 记录读不出来（超配额/数据库错）时页面不能装作「一台机器都没有」：
+        // 空表加一条说明，比一屏 0 元更像实话。
+        None => (Vec::new(), true),
+    };
     let today = today();
     // KTD3：拉取只发生在页面打开且无缓存时。动作路径（保存）不隐式拉——
     // 否则每次保存都要同步等一次网络往返。已有缓存也不拉，陈旧由 tick 兜底。
@@ -714,6 +816,16 @@ fn build_page(allow_fetch: bool) -> Value {
     let target = cfg.target_currency.clone();
 
     let mut blocks: Vec<Value> = Vec::new();
+
+    // 记录读不出来时先说明白：下面两张表会是空的，不说就成了「一台机器都没有」。
+    if unreadable {
+        blocks.push(json!({
+            "type": "notice",
+            "kind": "warning",
+            "text": "读不到插件存的节点记录（可能超出单次读取上限或数据库出错），本轮没有对账，\
+                     下面的表与统计暂缺；记录本身没有被改动，下次能读到时照旧",
+        }));
+    }
 
     // 汇率状态提示：成功过就报基准与更新时间，否则 warn。只要存在失败记录
     // （不管有没有旧缓存）就把原因与尝试时间并进来（R5/KTD4）。
@@ -749,7 +861,7 @@ fn build_page(allow_fetch: bool) -> Value {
     // 汇总统计与币种切换合成一处：第一格是展示币种下拉、后两格是金额，操作者
     // 一眼能把「哪两个数」和「按什么币种算的」对上。汇率不可用时金额印「—」，
     // 但下拉照常给——否则没缓存的部署连币种都换不了。
-    let (annual, remaining) = match totals(fx.as_ref(), today) {
+    let (annual, remaining) = match totals(fx.as_ref(), &nodes, today) {
         Some(((annual, remaining), missing)) => {
             if !missing.is_empty() {
                 blocks.push(json!({
@@ -781,7 +893,7 @@ fn build_page(allow_fetch: bool) -> Value {
     // 存下来但统计认不出的周期会让那台机器静默掉出年化成本（`cycle_months`
     // 返回 None）。只提醒，统计口径一律不变——这条提示与上面的币种缺失提示
     // 同类，故紧挨着它放；汇率不可用时同样要给（与汇率无关）。
-    let bad_cycles = unrecognised_cycles();
+    let bad_cycles = unrecognised_cycles(&nodes);
     if !bad_cycles.is_empty() {
         blocks.push(json!({
             "type": "notice",
@@ -797,27 +909,27 @@ fn build_page(allow_fetch: bool) -> Value {
     let window = cfg.threshold_days;
     let mut due: Vec<Value> = Vec::new();
     let mut all: Vec<Value> = Vec::new();
-    for (id, n) in all_nodes() {
+    for (id, n) in &nodes {
         let days_left =
             n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|e| (e - today).num_days());
-        let free = is_free(&n);
+        let free = is_free(n);
         all.push(json!({
             "id": id,
-            "name": n.name,
+            "name": &n.name,
             "price": n.price,
             // 价格列的前缀（币种符号）与同一行的币种绑在一起发给面板：前端照
             // 字段声明里的 prefix_key 取它，不用认识币种代码。
             "price_symbol": currency_prefix(&n.currency),
-            "currency": n.currency,
-            "billing_cycle": n.billing_cycle,
-            "expires_at": n.expires_at,
+            "currency": &n.currency,
+            "billing_cycle": &n.billing_cycle,
+            "expires_at": &n.expires_at,
             "free": free,
         }));
         if let Some(d) = days_left {
             if d >= 0 && d <= window {
                 due.push(json!({
-                    "name": n.name,
-                    "expires_at": n.expires_at,
+                    "name": &n.name,
+                    "expires_at": &n.expires_at,
                     "days_left": d,
                     "free": free,
                 }));
@@ -914,39 +1026,71 @@ fn handle_action(input: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// 清理（U9/KTD11）
-// ---------------------------------------------------------------------------
-
-/// 删掉已不在宿主节点表里的残留记录，返回清理统计。
-fn cleanup() -> Value {
-    // 拿不到存活集合时**不能**按"空集合"继续:那会把每一台机器的记录都删掉。
-    let Some(nodes) = nodes_basic() else {
-        log(3, "finance-stats: nodes_query 失败,拒绝清理");
-        return json!({ "error": "nodes_query 失败,无法确定存活节点;未清理任何记录" });
-    };
-    let live: std::collections::HashSet<i64> = nodes.into_iter().map(|(id, _)| id).collect();
-    let mut pruned = 0i64;
-    let mut freed = 0i64;
-    for (id, _) in all_nodes() {
-        if !live.contains(&id) {
-            if let Some(data) = data_get(&node_key(id)) {
-                freed += data.len() as i64;
-            }
-            data_delete(&node_key(id));
-            pruned += 1;
-        }
-    }
-    json!({ "freed_bytes": freed, "pruned": pruned })
-}
-
-// ---------------------------------------------------------------------------
 // 导出
 // ---------------------------------------------------------------------------
 
-/// 本插件不订阅宿主事件（tick 才是它的工作面），保留导出满足 ABI 契约。
+/// 宿主的节点生命周期事件。形状与 hub `notification_bus::Event` 的序列化一致：
+/// 按 `type` 标签分派、字段按名解析、多余字段忽略（词表扩展不会弄坏旧插件）。
+/// manifest 只订阅这两个；别的 `type` 解析失败，静默忽略。
+///
+/// 定长枚举而不是 `serde_json::Value`：事件派发的 fuel 预算只有
+/// `plugin.fuel_limit`（默认 1e6），是页面/tick 那一档的 1/20，而 `Value` 给每个
+/// 对象建一棵 BTreeMap，白付一笔解析开销。
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum NodeEvent {
+    /// 节点行被创建：事件是「这个 id 刚属于一台新机器」的权威声明。
+    NodeAdded {
+        node_id: i64,
+        #[serde(default)]
+        name: String,
+        created_at: Option<i64>,
+    },
+    /// 节点行被删除。`name` 本插件不读，故不解析。
+    NodeDeleted { node_id: i64, created_at: Option<i64> },
+}
+
+/// 宿主事件入口：`node_added` / `node_deleted`，启用期间实时同步。
+///
+/// 这里**只处理事件里那一台机器**，不做全量对账——事件预算见 [`NodeEvent`]，
+/// 全量对账会直接烧穿。漏派的事件由 tick 与页面渲染兜底。
 #[no_mangle]
-pub extern "C" fn on_event(_ptr: i32, _len: i32) -> i32 {
+pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
+    handle_node_event(&read_input(ptr, len));
     0
+}
+
+fn handle_node_event(input: &str) {
+    match serde_json::from_str::<NodeEvent>(input) {
+        Ok(NodeEvent::NodeAdded { node_id, name, created_at }) => {
+            // 身份相同 = 这台机器已经建过记录了（事件重投或迟到），什么都不做，
+            // 否则会把操作员刚填好的价格抹回空白；身份不同（或记录缺失）才写空白
+            // 记录——那时已有记录只可能属于被删掉的旧机器（id 被复用）。
+            let existing = load_node(node_id).and_then(|n| n.host_created_at);
+            if existing != created_at {
+                save_node(node_id, &blank_node(name, created_at));
+            }
+        }
+        Ok(NodeEvent::NodeDeleted { node_id, created_at }) => {
+            // 事件异步派发，可能与复用同一 id 的 node_added 乱序；身份不符就当
+            // 没发生过，否则会误删新节点的记录。
+            let stored = load_node(node_id).and_then(|n| n.host_created_at);
+            if stored.is_some() && created_at == stored {
+                data_delete(&node_key(node_id));
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// 把导出拿到的入参字节读成字符串；越界或空入参给空串（两个调用方对空串都是
+/// 无事可做）。
+fn read_input(ptr: i32, len: i32) -> String {
+    if ptr > 0 && len > 0 {
+        bytes_to_string(unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) })
+    } else {
+        String::new()
+    }
 }
 
 /// 每小时 tick。
@@ -965,18 +1109,7 @@ pub extern "C" fn render_page(_ptr: i32, _len: i32) -> i32 {
 /// 处理页面交互。
 #[no_mangle]
 pub extern "C" fn on_action(ptr: i32, len: i32) -> i32 {
-    let input = if ptr > 0 && len > 0 {
-        bytes_to_string(unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) })
-    } else {
-        String::new()
-    };
-    respond(&handle_action(&input))
-}
-
-/// 清理残留记录。
-#[no_mangle]
-pub extern "C" fn on_cleanup(_ptr: i32, _len: i32) -> i32 {
-    respond(&cleanup())
+    respond(&handle_action(&read_input(ptr, len)))
 }
 
 /// 把一段 JSON 经 host_resp_alloc 的缓冲写回宿主，返回字节数。
