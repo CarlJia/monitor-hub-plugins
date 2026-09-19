@@ -68,17 +68,16 @@
 ## 本地怎么跑
 
 ```sh
-./build.sh                 # 产出 plugin.wasm
-# 按本插件 plugin.toml 的 abi_version 取 monitor 上最高的
-# monitor-plugin-contract-v<abi>.* tag —— 与 release.yml / ci.yml 同一条规则。
-abi=$(grep -oE '^abi_version *= *[0-9]+' plugin.toml | grep -oE '[0-9]+$')
-tag=$(git ls-remote --tags --refs https://github.com/CarlJia/monitor.git \
-        "monitor-plugin-contract-v${abi}.*" | awk -F/ '{print $NF}' | sort -V | tail -1)
-[ -n "$tag" ] || { echo "monitor 上没有 ABI $abi 的 monitor-plugin-contract tag"; exit 1; }
-cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract --tag "$tag" --dev
-cargo test --release --features contract --test contract
-git checkout -- Cargo.toml  # 收尾(临时 dev-dep 不入仓)
+./build.sh                      # 在插件目录里：产出 plugin.wasm
+../scripts/contract-check.sh .  # 仍在插件目录里跑（脚本自己 cd 进目标目录），
+                                # 取 monitor 上对应 ABI 的正式 tag、拉那版契约
+                                # crate、跑 tests/contract.rs，收尾还原 Cargo.toml
 ```
+
+tag 规则与命令只在 `scripts/contract-check.sh` 里有一份实现——`ci.yml`(每个 PR)
+与 `release.yml`(每次发版)都调它。别把手写命令抄进插件仓:抄出来的那份会漏掉
+「只认正式 tag」的过滤(`sort -V` 会把 `-rc1` 排在同版本正式 tag 之后,而 monitor
+判失败后不会回滚那个 tag)。
 
 模板里的 `PLUGIN_ID` 与 `plugin.toml` 的 `plugin_id` 必须逐字一致(替身用它建 kv
 命名空间);测试里那条 assert 会替你挡住不一致,但变量名别写错。

@@ -113,7 +113,11 @@ jobs:
           done
           exit $fail
 
-      - name: Run plugin contract tests
+      # 裸 `cargo test`：tests/contract.rs 首行是 `#![cfg(feature = "contract")]`，
+      # 所以这里编进 0 个契约用例，跑的全是 tests/smoke.rs 的 wasmtime 桩宿主。
+      # 步骤名与下面的 summary 就按这个事实命名——别叫它 contract tests，那会让人
+      # 以为真宿主契约已经被这一门验过了（真契约门在 ci.yml / release.yml）。
+      - name: Run plugin smoke tests
         id: tests
         if: steps.monref.outputs.changed == 'true'
         run: |
@@ -134,7 +138,7 @@ jobs:
             echo "## ABI check vs monitor@${short}"
             echo
             echo "- monitor ABI_VERSION: \`${abi:-unknown}\`"
-            echo "- contract tests: \`${outcome:-unknown}\`"
+            echo "- smoke tests: \`${outcome:-unknown}\`"
             echo
             echo "| plugin | declared abi_version |"
             echo "|---|---|"
