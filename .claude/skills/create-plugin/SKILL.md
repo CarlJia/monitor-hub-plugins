@@ -36,9 +36,10 @@ Two reference implementations cover the full surface — start by reading one:
 5. **Write `<id>/Cargo.toml`.** Copy from the matching reference. Change `name` (use `_` not `-` — must be a valid Rust identifier) and `[lib].name`.
 6. **Write `<id>/src/lib.rs`.** Compose from [`references/examples.md`](references/examples.md) — pick one section per shape you need, plus the always-on allocator + bytes helpers.
 7. **Add `<id>/build.sh`** — copy from `tg-notify/build.sh`, change the wasm output filename (must match `[lib].name` with `-` → `_`, plus `.wasm`).
-8. **Build.** `cd <id> && ./build.sh` → produces `plugin.tar.gz` (contains `plugin.toml` + `plugin.wasm`).
-9. **Verify.** `scripts/validate.sh <id>` for manifest checks, then `cargo test` inside the plugin dir for the wasmtime smoke test.
-10. **Done when:** `plugin.tar.gz` exists, manifest passes validation, smoke test passes, every declared export exists with the right signature.
+8. **Add `<id>/tests/contract.rs` + the empty `contract` feature.** See [`references/contract-test.md`](references/contract-test.md) — 发布前 release.yml 用 monitor 的**真实宿主**验证产物,缺这个文件新插件发不了 release。
+9. **Build.** `cd <id> && ./build.sh` → produces `plugin.tar.gz` (contains `plugin.toml` + `plugin.wasm`).
+10. **Verify.** `scripts/validate.sh <id>` for manifest checks, then `cargo test` inside the plugin dir for the wasmtime smoke test.
+11. **Done when:** `plugin.tar.gz` exists, manifest passes validation, smoke test passes, `tests/contract.rs` 存在且 `Cargo.toml` 声明了 `[features] contract = []`, every declared export exists with the right signature.
 
 ## Hard rules (don't break these)
 
@@ -55,4 +56,5 @@ Two reference implementations cover the full surface — start by reading one:
 - [`references/manifest-schema.md`](references/manifest-schema.md) — `plugin.toml` fields with validation rules
 - [`references/page-protocol.md`](references/page-protocol.md) — JSON UI blocks for `render_page` / `on_action`
 - [`references/examples.md`](references/examples.md) — five minimal compilable skeletons
+- [`references/contract-test.md`](references/contract-test.md) — release 契约测试(真宿主)骨架 —— 每个插件必备
 - [`scripts/validate.sh`](scripts/validate.sh) — manifest parse + sanity
