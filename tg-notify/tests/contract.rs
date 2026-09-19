@@ -25,9 +25,25 @@ fn manifest_plugin_id() -> String {
         .to_owned()
 }
 
+/// plugin.toml 的 abi_version(与拉到的契约 crate 的 ABI_VERSION 比对:宿主面变了
+/// 却没 bump / 没打新 tag 导致拉到旧契约时,门会红而不是验错对象)。
+fn manifest_abi_version() -> i64 {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+        .expect("plugin.toml")
+        .lines()
+        .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == "abi_version").map(|(_, v)| v))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("plugin.toml 里应有数字 abi_version")
+}
+
 #[test]
 fn instantiates_and_drives_an_event_against_the_real_host() {
     assert_eq!(manifest_plugin_id(), PLUGIN_ID, "PLUGIN_ID 必须与 plugin.toml 的 plugin_id 一致");
+    assert_eq!(
+        monitor_plugin_contract::ABI_VERSION,
+        manifest_abi_version(),
+        "拉到的契约 ABI 必须等于本插件 plugin.toml 声明的 abi_version"
+    );
     let engine = wasmtime::Engine::default();
     let wasm = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.wasm"))
         .expect("plugin.wasm 缺失——先跑 ./build.sh");
