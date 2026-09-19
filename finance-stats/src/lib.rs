@@ -9,8 +9,11 @@
 //!   记录；拿不到宿主节点集合时一条都不动；
 //! - 订阅宿主事件 `node_added` / `node_deleted`，启用期间新增与删除实时同步；
 //! - 每小时 tick：用 `http_get` 从 Frankfurter 拉汇率并缓存，再扫描到期日
-//!   （到期的在线节点按周期向后滚动；进入阈值窗口的经 `emit_event` 发
-//!   `plugin_expiry_soon`）；
+//!   （到期的在线节点按周期向后滚动；进入 `threshold_days` 窗口的经
+//!   `emit_event` 发 `plugin_expiry_soon`，窗口内每天一次，靠记录里的
+//!   `last_notified` 去重）。提醒阈值取自面板 kv（「渠道配置」弹窗里的
+//!   `threshold_days`，见 `plugin.toml` 的 `[[kv]]`）；没配就用 `config`
+//!   记录里留下的值、再退到默认 7 天；
 //! - `render_page` 渲染统计页（年化续费成本 / 剩余价值 / 到期列表 / 编辑表）；
 //!   首次渲染时若尚无汇率缓存，先同步拉一次（R4/KTD3）；
 //! - `on_action` 处理页面交互（切币种 / 保存节点 / 立即刷新汇率）——其余动作
@@ -23,7 +26,11 @@
 //! | `config` | `{target_currency, threshold_days}` |
 //! | `fx` | `{base, rates: {CUR: number}, fetched_at}` |
 //! | `fx_status` | `{reason, attempted_at}`——最近一次拉取失败的原因与时间；成功即删（R5/KTD4） |
-//! | `node:<id>` | `{name, price, currency, billing_cycle, expires_at, purchased_at, host_created_at}` |
+//! | `node:<id>` | `{name, price, currency, billing_cycle, expires_at, purchased_at, host_created_at, last_notified}` |
+//!
+//! `config` 里的 `threshold_days` 只是回退：面板 kv 的 `threshold_days` 优先
+//! （`threshold_from_kv`），两者都没有才用默认 7 天。升级前的部署不必迁移——
+//! 旧的 `config` 记录照常作数，操作员在「渠道配置」里填一次就换了来源。
 //!
 //! 时间一律向宿主要（`host_now`），日期算术交给 chrono 的 NaiveDate。
 //! 时区用 UTC——与面板展示的本地日期可能差一天，这是已知取舍（宿主原 Logic
@@ -48,6 +55,11 @@ extern "C" {
     /// 当前 Unix 秒。
     #[link_name = "now"]
     fn host_now() -> i64;
+    /// 读面板 kv（插件在「渠道配置」弹窗里填的值，命名空间
+    /// `plugin.<plugin_id>:<key>`）：返回写入 out 的字节数，0 = 无值，
+    /// -1 = 越界/非法 UTF-8。
+    #[link_name = "kv_get"]
+    fn host_kv_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     /// 让宿主经 `__alloc` 分配响应缓冲并记住指针。
     #[link_name = "resp_alloc"]
     fn host_resp_alloc(cap: i32) -> i32;
@@ -168,6 +180,23 @@ fn data_list(prefix: &str, buf: &mut [u8]) -> Option<Vec<(String, String)>> {
 }
 
 // ---------------------------------------------------------------------------
+// 面板 kv 配置（manifest 的 [[kv]] 声明，面板「渠道配置」弹窗写入）
+// ---------------------------------------------------------------------------
+
+/// 读一个面板 kv 项。无值（返回 0）、越界（负数）或非法 UTF-8 都归成 None。
+fn kv_get_string(key: &str) -> Option<String> {
+    let (kp, kl) = write_str(key);
+    // 阈值只有几位数字；256 字节容纳任何合理输入，写超了被宿主截断后解析失败、
+    // 回退默认——不会把半个数字当成阈值。
+    let mut buf = [0u8; 256];
+    let n = unsafe { host_kv_get(kp, kl, buf.as_mut_ptr() as i32, buf.len() as i32) };
+    if n <= 0 {
+        return None;
+    }
+    Some(bytes_to_string(&buf[..n as usize]))
+}
+
+// ---------------------------------------------------------------------------
 // 领域模型
 // ---------------------------------------------------------------------------
 
@@ -190,6 +219,11 @@ struct NodeFin {
     /// 不重置——里面可能是操作员已经填好的价格。
     #[serde(default)]
     host_created_at: Option<i64>,
+    /// 上次发到期提醒时该节点的 `days_left`。提醒在窗口内**每天一次**，靠它
+    /// 去重：宿主每小时一拍，`days_left` 一天只减一次，值没变就是今天已经提醒过。
+    /// 升级前留下的记录没有这个字段（`None`），进窗口时会照常提醒一次。
+    #[serde(default)]
+    last_notified: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +268,23 @@ impl Config {
             data_put("config", &s);
         }
     }
+
+    /// 生效的提醒阈值。面板 kv 优先（操作员在「渠道配置」里改的那个），其次是
+    /// `config` 记录里 `threshold_days`（升级前手工写库留下的值），最后是编译期
+    /// 默认。回退链上少一环都不报错——没配过的部署照旧按默认 7 天提醒。
+    ///
+    /// 不去改写 `self.threshold_days`：`save` 会把它写回 `config` 记录，覆盖了
+    /// 就等于让 kv 的值渗进另一个来源，之后删掉 kv 也回不到原样。
+    fn threshold_days(&self) -> i64 {
+        threshold_from_kv().unwrap_or(self.threshold_days)
+    }
+}
+
+/// 面板 kv 里的 `threshold_days`。非正整数（0、负数、非数字、超长截断）一律当
+/// 没配，回退到 `config` 记录：窗口判据是 `days_left <= 阈值`，0 或负数会让窗口
+/// 变空，"配了个静默失效的值"比回退到能用的默认更难查。
+fn threshold_from_kv() -> Option<i64> {
+    kv_get_string("threshold_days").and_then(|s| s.trim().parse::<i64>().ok()).filter(|d| *d > 0)
 }
 
 /// 周期名 → 月数 → 下拉里的中文展示标签，顺序即下拉里的展示顺序。统计口径、
@@ -350,6 +401,7 @@ fn blank_node(name: String, created_at: Option<i64>) -> NodeFin {
         expires_at: None,
         purchased_at: Some(today().to_string()),
         host_created_at: created_at,
+        last_notified: None,
     }
 }
 
@@ -655,12 +707,18 @@ fn roll_if_online(id: i64, n: &mut NodeFin, online: &[i64], today: NaiveDate) ->
         }
     }
     n.expires_at = Some(next.to_string());
+    // 滚到新周期，提醒从头计：旧周期留下的天数可能恰好撞上新窗口里的某一天，
+    // 那会让新周期的第一次提醒被吞掉。
+    n.last_notified = None;
     true
 }
 
 /// 一拍的全部周期工作：刷新汇率 → 对账 → 扫描到期。
 fn tick() {
     let cfg = Config::load();
+    // 阈值整轮读一次：kv 是一次跨 wasm 边界的调用，放进节点循环里就变成每台机器
+    // 各来一次，换来的是同一个值。
+    let threshold = cfg.threshold_days();
     if refresh_fx(&cfg) {
         log(1, "finance-stats: 汇率已更新");
     }
@@ -680,8 +738,7 @@ fn tick() {
         }
         None => {
             // 拿不到在线集合只影响**滚动**：到期提醒读的全是插件自己的数据
-            // （expires_at 与阈值），照常发——它按等级精确匹配一次，漏一轮就整个
-            // 计费周期都不会再响。
+            // （expires_at、阈值与去重状态），照常发。
             log(2, "finance-stats: nodes_query 失败,本轮跳过到期滚动");
             (known, Vec::new())
         }
@@ -696,18 +753,24 @@ fn tick() {
             continue;
         };
         let days_left = (exp - today).num_days();
-        // 精确等值匹配单一档位，已过期（<=0）不提醒（那是滚动或人工处理的事）。
-        if days_left > 0 && days_left == cfg.threshold_days {
+        // 窗口内（`0 < days_left <= 阈值`）每天提醒一次；已过期（<=0）不提醒——
+        // 那是滚动或人工处理的事。宿主每小时一拍，而 `days_left` 一天只减一次，
+        // 用记录里上次提醒的天数去重，否则一天会轰出 24 条。
+        if days_left > 0 && days_left <= threshold && n.last_notified != Some(days_left) {
             let payload = json!({
                 "node_id": id,
                 "name": n.name,
                 "expires_at": n.expires_at,
                 "days_left": days_left,
-                "threshold_days": cfg.threshold_days,
+                "threshold_days": threshold,
             });
             let (np, nl) = write_str("plugin_expiry_soon");
             let (pp, pl) = write_str(&payload.to_string());
             unsafe { host_emit_event(np, nl, pp, pl) };
+            // 先发后记：记失败最多下一轮重发一次；反过来的话，这一天的提醒就
+            // 整个被吞掉了。
+            n.last_notified = Some(days_left);
+            save_node(id, &n);
         }
     }
 }
@@ -916,7 +979,7 @@ fn build_page(allow_fetch: bool) -> Value {
     }
 
     // 到期窗口列表。
-    let window = cfg.threshold_days;
+    let window = cfg.threshold_days();
     let mut due: Vec<Value> = Vec::new();
     let mut all: Vec<Value> = Vec::new();
     for (id, n) in &nodes {
