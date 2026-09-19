@@ -57,7 +57,7 @@ jobs:
           test -n "$tag" || { echo "::error::no monitor-plugin-contract tag for ABI $abi"; exit 1; }
           echo "validating ${{ steps.plugin.outputs.id }} against $tag"
           cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract --tag "$tag" --dev
-          cargo test --release --test contract
+          cargo test --release --features contract --test contract
           # Cargo.lock is gitignored here; only Cargo.toml is tracked, so just it.
           git checkout -- Cargo.toml
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "contract")]
 //! 真宿主契约测试:把刚 `./build.sh` 出来的 `plugin.wasm` 用 **monitor 的真实
 //! host**(`monitor-plugin-contract`)instantiate,再驱动一条事件。桩烟测
 //! (`tests/smoke.rs`)用的是仓内手写宿主,测不出「宿主函数 import 签名漂移」;
@@ -12,8 +13,21 @@ use monitor_plugin_contract::{linker, setting_key, ContractState, MockHttp};
 /// `plugin.<id>:<key>`,与真宿主一致。
 const PLUGIN_ID: &str = "com.example.tg-notify";
 
+/// plugin.toml 的 plugin_id(与常量比对:契约替身用它建 kv 命名空间,对不上会
+/// 在错误的命名空间上跑而假绿——assert 而非靠人记)。
+fn manifest_plugin_id() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+        .expect("plugin.toml")
+        .lines()
+        .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == "plugin_id").map(|(_, v)| v))
+        .and_then(|v| v.split('"').nth(1))
+        .expect("plugin.toml 里应有 plugin_id")
+        .to_owned()
+}
+
 #[test]
 fn instantiates_and_drives_an_event_against_the_real_host() {
+    assert_eq!(manifest_plugin_id(), PLUGIN_ID, "PLUGIN_ID 必须与 plugin.toml 的 plugin_id 一致");
     let engine = wasmtime::Engine::default();
     let wasm = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.wasm"))
         .expect("plugin.wasm 缺失——先跑 ./build.sh");
