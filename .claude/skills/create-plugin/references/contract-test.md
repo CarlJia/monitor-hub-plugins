@@ -1,8 +1,9 @@
-# 契约测试(release 门)
+# 契约测试(release 门 + PR 门)
 
-每个插件都带一份 `tests/contract.rs`:发布前(见 `release.yml`)用 **monitor 的真实
-宿主** `monitor-plugin-contract` instantiate 本插件的 `plugin.wasm` 并驱动一条路径。
-它测的是**宿主函数 import 签名 / 导出契约**——桩烟测(`tests/smoke.rs`)测不出这个。
+每个插件都带一份 `tests/contract.rs`:发布前与每个 PR(`release.yml` + `ci.yml`)用
+**monitor 的真实宿主** `monitor-plugin-contract` instantiate 本插件的 `plugin.wasm`
+并驱动一条路径。它测的是**宿主函数 import 签名 / 导出契约**——桩烟测
+(`tests/smoke.rs`)测不出这个。
 
 ## 两个必备件
 
@@ -14,11 +15,11 @@
    contract = []
    ```
 
-   原因:`monitor-plugin-contract` 只在 release 时临时加(不进仓),所以**裸
-   `cargo test`(ci.yml 每次 push/PR 都跑)绝不能编译这个文件**——feature 关掉时
-   整个文件为空、不引用缺失的 crate,裸测试绿;release 用
-   `cargo test --features contract --test contract` 才真跑。**漏掉 `--features
-   contract` 会编译出 0 个用例并静默通过**。
+   原因:`monitor-plugin-contract` 是**临时加的 dev-dep(不进仓)**,所以 feature
+   关掉时整个文件为空、不引用那个缺失的 crate,裸 `cargo test` 照常绿。真跑必须先
+   `cargo add` 它再带 `--features contract`——`release.yml`(发布门)与 `ci.yml`
+   (PR 门)都这么做。**漏掉 `--features contract` 会编译出 0 个用例并静默通过**;
+   这正是它过去只在 release 才暴露的原因。
 
 2. **`tests/contract.rs`**——把下面的模板里 `PLUGIN_ID` 换成你的
    `plugin.toml` 的 `plugin_id`,驱动的事件换成本插件真实订阅的事件(见
@@ -68,9 +69,14 @@
 
 ```sh
 ./build.sh                 # 产出 plugin.wasm
-cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract \
-      --tag monitor-plugin-contract-v2 --dev   # tag 主版本 = 本插件 abi_version
-cargo test --features contract --test contract
+# 按本插件 plugin.toml 的 abi_version 取 monitor 上最高的
+# monitor-plugin-contract-v<abi>.* tag —— 与 release.yml / ci.yml 同一条规则。
+abi=$(grep -oE '^abi_version *= *[0-9]+' plugin.toml | grep -oE '[0-9]+$')
+tag=$(git ls-remote --tags --refs https://github.com/CarlJia/monitor.git \
+        "monitor-plugin-contract-v${abi}.*" | awk -F/ '{print $NF}' | sort -V | tail -1)
+[ -n "$tag" ] || { echo "monitor 上没有 ABI $abi 的 monitor-plugin-contract tag"; exit 1; }
+cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract --tag "$tag" --dev
+cargo test --release --features contract --test contract
 git checkout -- Cargo.toml  # 收尾(临时 dev-dep 不入仓)
 ```
 

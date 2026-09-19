@@ -97,3 +97,25 @@ jobs:
 
       - run: cargo test
         working-directory: ${{ matrix.plugin }}
+
+      # tests/contract.rs is `#![cfg(feature = "contract")]`, so the plain
+      # `cargo test` above compiles it to nothing — without this step the
+      # contract gate first runs in release.yml, i.e. after the tag is pushed.
+      # Same tag rule and same --release command as release.yml, so green here
+      # means green there. The plugin name arrives via env, never interpolated
+      # into the script text: it comes from a directory name the PR controls.
+      - name: Validate the wasm against monitor's contract
+        working-directory: ${{ matrix.plugin }}
+        env:
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          abi=$(grep -oE '^abi_version *= *[0-9]+' plugin.toml | grep -oE '[0-9]+$' || true)
+          test -n "$abi" || { echo "::error::plugin.toml has no abi_version"; exit 1; }
+          tag=$(git ls-remote --tags --refs https://github.com/CarlJia/monitor.git \
+                  "monitor-plugin-contract-v${abi}.*" | awk -F/ '{print $NF}' | sort -V | tail -1)
+          test -n "$tag" || { echo "::error::no monitor-plugin-contract tag for ABI $abi"; exit 1; }
+          echo "validating $PLUGIN against $tag"
+          ./build.sh
+          cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract --tag "$tag" --dev
+          cargo test --release --features contract --test contract
+          git checkout -- Cargo.toml
