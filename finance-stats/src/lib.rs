@@ -363,10 +363,9 @@ fn blank_node(name: String, created_at: Option<i64>) -> NodeFin {
 /// - 身份不符 → 同一个 id 已被 SQLite 复用给另一台机器，重置为空白记录；
 /// - 宿主已无这个 id → 删掉记录。
 ///
-/// 返回顺序按记录键排（与宿主 `data_list` 的 `ORDER BY record_key` 同序，如
-/// `node:1`、`node:10`、`node:2`）：页面行序与统计口径都建立在这个顺序上。这一轮
-/// 新建的记录并进同一份排序，不会先挂在末尾、下次渲染再跳回中间；`HashMap` 的
-/// 迭代序每个实例都不一样，不能拿来当输出顺序。
+/// 返回顺序即 `host` 的顺序，也就是 hub 面板节点列表的顺序：页面行序与统计口径
+/// 都建立在这个顺序上，操作者在插件页看到的行序才与面板一致。这一轮新建的记录
+/// 同样落在它的宿主位置上，不会先挂在末尾、下次渲染再跳回中间。
 fn reconcile_with(host: &[HostNode], known: Vec<(i64, NodeFin)>) -> Vec<(i64, NodeFin)> {
     let mut by_id: HashMap<i64, NodeFin> = known.into_iter().collect();
     let mut live: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -403,10 +402,19 @@ fn reconcile_with(host: &[HostNode], known: Vec<(i64, NodeFin)>) -> Vec<(i64, No
         data_delete(&node_key(id));
         by_id.remove(&id);
     }
-    // 按记录键排序输出：与宿主 `ORDER BY record_key` 同序，本轮新建的记录也在
-    // 同一份排序里（`sort_by_cached_key` 每条只算一次键）。
-    let mut out: Vec<(i64, NodeFin)> = by_id.into_iter().collect();
-    out.sort_by_cached_key(|(id, _)| node_key(*id));
+    // 按宿主顺序输出：`nodes_query` 回的正是 hub 面板的 `ORDER BY sort, id`
+    // （用户拖拽序优先、数字 id 兜底），照搬它页面行序才与面板一致。不能按记录键
+    // 排——那是字符串序（`node:10` 跑到 `node:2` 前），而且完全忽略 `sort`；更
+    // 不能用 `HashMap` 的迭代序，它每个实例都不一样。
+    //
+    // 此时 `by_id` 的键集恰好等于 `host` 的 id 集：宿主已无的上面刚删光，
+    // 每个宿主 id 又都在循环里建过或确认过记录，所以这里既不漏也不多。
+    let mut out: Vec<(i64, NodeFin)> = Vec::with_capacity(by_id.len());
+    for h in host {
+        if let Some(n) = by_id.remove(&h.id) {
+            out.push((h.id, n));
+        }
+    }
     out
 }
 
@@ -416,6 +424,8 @@ fn reconcile_with(host: &[HostNode], known: Vec<(i64, NodeFin)>) -> Vec<(i64, No
 /// - 插件自己的记录读不出来 → `None`：这轮**什么都不能写**（把读失败当成空集合
 ///   会把每台机器都改写成空白记录），调用方按「拿不到数据」处理；
 /// - 宿主节点表读不出来 → 原样返回已有记录、不做增删改（见 [`host_nodes`]）。
+///   这条路上没有宿主顺序可用，行序退回 `data_list` 的记录键序——拿不到面板顺序
+///   时只能如此，下一轮读成功即恢复。
 fn reconcile() -> Option<Vec<(i64, NodeFin)>> {
     let mut buf = vec![0u8; BUF];
     let Some(known) = all_nodes(&mut buf) else {
