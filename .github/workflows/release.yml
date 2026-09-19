@@ -74,7 +74,9 @@ jobs:
           if [ -n "$prev" ]; then
             range="${prev}..${tag}"
           else
-            range="$(git rev-list --max-parents=0 HEAD | head -1)..${tag}"
+            # 首个 release:`A..B` 会排除 A 自己,拿根提交当左端会漏掉初始提交里
+            # `$plugin/` 下的改动。直接取整个 tag 的历史(仍由下面的路径过滤限定)。
+            range="$tag"
           fi
           notes=$(git log --no-decorate --pretty='- %s (%h)' "$range" -- "${plugin}/")
 

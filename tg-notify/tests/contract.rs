@@ -5,9 +5,13 @@
 //! 这个测试会——签名不匹配时 `instantiate` 直接失败。
 //!
 //! release.yml 在 `./build.sh` 之后、`gh release create` 之前跑它。
-//! 本地跑:先 `./build.sh`,再 `cargo test --test contract`。
+//! 本地跑:先 `./build.sh`,再 `cargo test --features contract --test contract`。
 
-use monitor_plugin_contract::{linker, setting_key, ContractState, MockHttp};
+use std::sync::Arc;
+
+use monitor_plugin_contract::{
+    constants::DEFAULT_FUEL_LIMIT, linker, setting_key, ContractState, HttpMethod, MockHttp,
+};
 
 /// 必须等于本插件 `plugin.toml` 的 `plugin_id`:契约替身用它建 kv 命名空间
 /// `plugin.<id>:<key>`,与真宿主一致。
@@ -44,18 +48,24 @@ fn instantiates_and_drives_an_event_against_the_real_host() {
         manifest_abi_version(),
         "拉到的契约 ABI 必须等于本插件 plugin.toml 声明的 abi_version"
     );
-    let engine = wasmtime::Engine::default();
+
+    // 与真宿主同配置:开 fuel 计量。monitor 的 new_engine 显式开了它,并注释
+    // 警告"不开则 set_fuel 静默无效"——不开的话燃料耗尽路径在门上不复现。
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
     let wasm = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.wasm"))
         .expect("plugin.wasm 缺失——先跑 ./build.sh");
     let module = wasmtime::Module::new(&engine, &wasm).expect("plugin.wasm 必须能编译");
 
-    // 预置配置 + 一个 200 的假 http,让 on_event 能走完全程并返回 0。
-    let state = ContractState::for_test(PLUGIN_ID)
-        .with_http(Box::new(MockHttp::respond_with(200, b"{\"ok\":true}")));
+    // 预置配置 + 一个 200 的假 http;留住句柄,事后断言"真的发了 POST"。
+    let http = Arc::new(MockHttp::respond_with(200, b"{\"ok\":true}"));
+    let state = ContractState::for_test(PLUGIN_ID).with_http(Box::new(http.clone()));
     state.kv().set(&setting_key(PLUGIN_ID, "bot_token"), "123456:ABC-DEF");
     state.kv().set(&setting_key(PLUGIN_ID, "chat_id"), "-1001234567890");
 
     let mut store = wasmtime::Store::new(&engine, state);
+    store.set_fuel(DEFAULT_FUEL_LIMIT).unwrap();
     let instance = linker::<ContractState>(&engine)
         .expect("host linker 构建")
         .instantiate(&mut store, &module)
@@ -69,4 +79,10 @@ fn instantiates_and_drives_an_event_against_the_real_host() {
     let mem = instance.get_memory(&mut store, "memory").unwrap();
     mem.data_mut(&mut store)[ptr as usize..ptr as usize + payload.len()].copy_from_slice(payload);
     assert_eq!(on_event.call(&mut store, (ptr, payload.len() as i32)).unwrap(), 0);
+
+    // 门的一半价值在这里:不仅"没炸",而且**真的**把通知发了出去。
+    let calls = http.calls();
+    assert_eq!(calls.len(), 1, "on_event 应对 Telegram 发一次 POST");
+    assert_eq!(calls[0].method, HttpMethod::Post);
+    assert!(calls[0].url.starts_with("https://api.telegram.org/"), "实际 URL: {}", calls[0].url);
 }
