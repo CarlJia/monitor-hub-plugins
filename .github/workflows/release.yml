@@ -41,6 +41,26 @@ jobs:
       - run: ./build.sh
         working-directory: ${{ steps.plugin.outputs.id }}
 
+      # The real gate: instantiate the freshly built plugin.wasm against
+      # monitor's REAL host (monitor-plugin-contract) and drive it. A host
+      # signature change that keeps abi_version the same still breaks a plugin —
+      # the stub smoke test cannot catch that, this can (import mismatch fails
+      # instantiate). The dev-dep is temporary: it is never committed.
+      - name: Validate wasm against the monitor contract
+        working-directory: ${{ steps.plugin.outputs.id }}
+        run: |
+          abi=$(grep -oE '^abi_version *= *[0-9]+' plugin.toml | grep -oE '[0-9]+$')
+          test -n "$abi" || { echo "::error::plugin.toml has no abi_version"; exit 1; }
+          # Highest monitor-plugin-contract-v<abi>.* tag on the monitor repo.
+          tag=$(git ls-remote --tags --refs https://github.com/CarlJia/monitor.git \
+                  "monitor-plugin-contract-v${abi}.*" | awk -F/ '{print $NF}' | sort -V | tail -1)
+          test -n "$tag" || { echo "::error::no monitor-plugin-contract tag for ABI $abi"; exit 1; }
+          echo "validating ${{ steps.plugin.outputs.id }} against $tag"
+          cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract --tag "$tag" --dev
+          cargo test --release --test contract
+          # Cargo.lock is gitignored here; only Cargo.toml is tracked, so just it.
+          git checkout -- Cargo.toml
+
       - name: Publish release
         run: |
           tag="$GITHUB_REF_NAME"

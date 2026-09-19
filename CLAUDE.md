@@ -9,10 +9,10 @@
 ABI 字段表、host_funcs 实现、manifest 校验逻辑**不在本仓**——它们在 monitor 仓：
 
 - **ABI 文档与字段表**：monitor 仓 `README.md` 的「插件开发」章节
-- **host 函数实现**：`monitor/src/plugin/host_funcs.rs`（14 个函数）
+- **host 函数实现**:`monitor/src/plugin/host_funcs.rs` + 契约 crate `monitor/crates/monitor-plugin-contract/`(13 个宿主函数的**唯一实现**在契约 crate;`host_funcs.rs` 只留 SSRF 网段判定与真 reqwest 调用)
 - **manifest 校验**：`monitor/src/plugin/manifest.rs`
 
-改 ABI 必须先在 monitor 仓改 host_funcs.rs / manifest.rs。本仓的 ABI 兼容性有两道检查：`ci.yml` 在每次 push/PR 上跑一道便宜的 ABI 门（对照 monitor 当前 `ABI_VERSION` 校验各 `plugin.toml`）；`abi-check.yml` 每小时轮询 monitor 主分支 HEAD，HEAD 未变时跳过，变则读取 `ABI_VERSION` 并重跑契约测试。注意 `workflow_run` 不能跨仓触发，所以是轮询而非 push 即时。
+改 ABI 必须先在 monitor 仓改 host_funcs.rs / manifest.rs(契约 crate 随之更新,版本同步由 monitor CI 守)。本仓的 ABI 兼容性有**三道门**,详见下面「跨仓信号」:发布时真宿主契约(release.yml,**主防线**)、`ci.yml` 的 abi-gate(声明级整数门)、`abi-check.yml`(定时轮询)。
 
 ## 工作流
 
@@ -25,12 +25,17 @@ ABI 字段表、host_funcs 实现、manifest 校验逻辑**不在本仓**——�
 - 当前所有插件从 `1.0.0` 起（拆仓点 fresh-start）
 - Patch = bug fix；Minor = 新增功能（保持 ABI v2 兼容）；Major = 破坏 ABI 兼容（需 monitor 先 bump）
 
-## 跨仓信号与它的边界（重要）
+## 跨仓信号:三道门
 
-两道门校验的都是**声明的整数 `abi_version`**,契约测试跑的是**仓内 wasmtime 桩宿主**（`tests/smoke.rs`）——**不是** monitor 的真实宿主。因此下面这些**不会被任何门发现**,只在生产实例化/运行时炸:
+1. **发布时真宿主契约(`release.yml`)—— 主防线**。`release.yml` 在 `./build.sh` 之后,按本插件 `plugin.toml` 的 `abi_version` 拉对应主版本的 `monitor-plugin-contract` crate,用 **monitor 的真实宿主** instantiate 本插件的 `plugin.wasm` 并驱动它(`tests/contract.rs`)。宿主函数 import 签名或导出契约漂移 → `instantiate` 失败 → **release 红**。这是唯一能发现「宿主签名变了但 `abi_version` 整数没变」的门。
+2. **`ci.yml` 的 abi-gate(每次 push/PR)** —— 声明级:对照 monitor 当前 `ABI_VERSION` 校验各 `plugin.toml` 的整数。
+3. **`abi-check.yml`(定时轮询 monitor HEAD)** —— 声明级 + 桩测试:整数匹配 + 桩烟测。
 
-- 改 `host_funcs.rs` 的函数签名/语义但**没 bump** `ABI_VERSION`（整数没变 → 全绿；桩没跟着改 → 桩测试也绿）
-- 调 monitor 的运行时预算（如 `DEFAULT_HOOK_FUEL_LIMIT`）——不属于 ABI，无门反应；smoke 里的 `PROD_HOOK_FUEL` 是**手抄**常量
-- quota / SSRF / deadline / record-cap 等宿主行为——桩不强制
+## 仍不由任何门覆盖的
 
-跨仓 ABI 一致性目前**靠人工纪律**（bump 整数、保持桩与真宿主同步）。要根治需在 monitor 侧加「host import 面 fingerprint 测试」或「真宿主契约 harness」,那是独立于本次拆仓的工作。
+真宿主契约测的是**签名/导出契约 + 本次驱动的那条路径**;下面这些仍只在生产暴露:
+
+- 调 monitor 运行时预算(如 `DEFAULT_HOOK_FUEL_LIMIT`)——不在 ABI 里;`tests/smoke.rs` 的 `PROD_HOOK_FUEL` 是手抄常量(桩烟测是 fast feedback,非契约)。
+- 契约测试只驱动一条事件 / 一个 hook;插件的其余分支靠 `tests/smoke.rs` + 手测。
+
+写新插件时要过 release 契约门:`plugin.toml` 的 `plugin_id` 必须与 `tests/contract.rs` 里 `ContractState::for_test(...)` 传的 id 逐字一致(契约替身用它建 kv 命名空间)。

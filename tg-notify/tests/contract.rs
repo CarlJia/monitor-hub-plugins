@@ -1,0 +1,42 @@
+//! 真宿主契约测试:把刚 `./build.sh` 出来的 `plugin.wasm` 用 **monitor 的真实
+//! host**(`monitor-plugin-contract`)instantiate,再驱动一条事件。桩烟测
+//! (`tests/smoke.rs`)用的是仓内手写宿主,测不出「宿主函数 import 签名漂移」;
+//! 这个测试会——签名不匹配时 `instantiate` 直接失败。
+//!
+//! release.yml 在 `./build.sh` 之后、`gh release create` 之前跑它。
+//! 本地跑:先 `./build.sh`,再 `cargo test --test contract`。
+
+use monitor_plugin_contract::{linker, setting_key, ContractState, MockHttp};
+
+/// 必须等于本插件 `plugin.toml` 的 `plugin_id`:契约替身用它建 kv 命名空间
+/// `plugin.<id>:<key>`,与真宿主一致。
+const PLUGIN_ID: &str = "com.example.tg-notify";
+
+#[test]
+fn instantiates_and_drives_an_event_against_the_real_host() {
+    let engine = wasmtime::Engine::default();
+    let wasm = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.wasm"))
+        .expect("plugin.wasm 缺失——先跑 ./build.sh");
+    let module = wasmtime::Module::new(&engine, &wasm).expect("plugin.wasm 必须能编译");
+
+    // 预置配置 + 一个 200 的假 http,让 on_event 能走完全程并返回 0。
+    let state = ContractState::for_test(PLUGIN_ID)
+        .with_http(Box::new(MockHttp::respond_with(200, b"{\"ok\":true}")));
+    state.kv().set(&setting_key(PLUGIN_ID, "bot_token"), "123456:ABC-DEF");
+    state.kv().set(&setting_key(PLUGIN_ID, "chat_id"), "-1001234567890");
+
+    let mut store = wasmtime::Store::new(&engine, state);
+    let instance = linker::<ContractState>(&engine)
+        .expect("host linker 构建")
+        .instantiate(&mut store, &module)
+        .expect("真实宿主的 import 签名必须与本插件一致");
+
+    let on_event = instance.get_typed_func::<(i32, i32), i32>(&mut store, "on_event").unwrap();
+    let alloc = instance.get_typed_func::<(i32,), i32>(&mut store, "__alloc").unwrap();
+    let payload =
+        br#"{"type":"agent_offline","node_id":5,"name":"edge-1","observed_at":100,"last_seen_at":90}"#;
+    let ptr = alloc.call(&mut store, (payload.len() as i32,)).unwrap();
+    let mem = instance.get_memory(&mut store, "memory").unwrap();
+    mem.data_mut(&mut store)[ptr as usize..ptr as usize + payload.len()].copy_from_slice(payload);
+    assert_eq!(on_event.call(&mut store, (ptr, payload.len() as i32)).unwrap(), 0);
+}
