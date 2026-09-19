@@ -1130,21 +1130,26 @@ fn currency_symbols_follow_the_target_currency() {
     assert_eq!(rows[0]["price_symbol"], "$", "换展示币种不该动节点自己的币种：{rows:?}");
 }
 
-/// 页面的行序必须是确定的：沿用宿主 `data_list` 的键序（`node:1`、`node:10`、
-/// `node:2`……字符串序），而不是 `HashMap` 的迭代序——后者每个实例都不一样，
-/// 同一份数据两次渲染就可能给出不同的行序。
+/// 页面行序必须与 hub 的节点列表一致。hub 列表来自 `SELECT * FROM node ORDER BY
+/// sort, id`（用户拖拽排序优先，数字 id 兜底），而 `nodes_query` 回给插件的**正
+/// 是这一个顺序**——插件必须原样沿用，不能按记录键重排。
+///
+/// 宿主这里声明成 12→1 的倒序，与记录键的字符串序（`node:1`、`node:10`、
+/// `node:11`、`node:12`、`node:2`……）和数字 id 序（1…12）都不相同，三种候选
+/// 排序的结果互不混淆。同时它也是「行序确定」的回归：不能是 `HashMap` 的迭代
+/// 序——后者每个实例都不一样，同一份数据两次渲染就可能给出不同的行序。
 #[test]
-fn form_rows_keep_the_host_key_order() {
+fn form_rows_follow_the_host_node_order() {
     let engine = engine();
     let wasm = build_wasm();
     let host = Host::default();
     host.http_body.lock().unwrap().replace(fx_json("CNY"));
-    let nodes: Vec<(i64, &str)> = (1..=12).map(|i| (i, "edge")).collect();
-    declare_host_nodes(&host, &nodes);
+    let names: Vec<(i64, String)> = (1..=12).rev().map(|i| (i, format!("edge-{i}"))).collect();
+    declare_host_nodes(&host, &names.iter().map(|(id, n)| (*id, n.as_str())).collect::<Vec<_>>());
     let (mut store, instance) = instantiate(&engine, &wasm, host);
     for i in 1..=12 {
-        // node:3 故意不预置：它会在这次渲染里被对账建出来，行序仍须按记录键排，
-        // 不能先挂在末尾、下一次渲染再跳回中间。
+        // node:3 故意不预置：它会在这次渲染里被对账建出来，行序仍须落在宿主的
+        // 位置上，不能先挂在末尾、下一次渲染再跳回中间。
         if i != 3 {
             seed(
                 &store,
@@ -1162,8 +1167,8 @@ fn form_rows_keep_the_host_key_order() {
     let first = row_ids(&mut store);
     assert_eq!(
         first,
-        vec![1, 10, 11, 12, 2, 3, 4, 5, 6, 7, 8, 9],
-        "行序应沿用宿主的键序（node:10 排在 node:2 之前）"
+        vec![12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+        "行序应与 hub 节点列表同序（宿主序），不是记录键序、也不是数字 id 序"
     );
     assert_eq!(row_ids(&mut store), first, "同一份数据两次渲染的行序必须一致");
 }
