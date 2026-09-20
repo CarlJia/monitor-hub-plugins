@@ -1,7 +1,7 @@
 # tg-notify 的 manifest。字段表见仓库 README 的「插件开发」章节。
 plugin_id = "com.example.tg-notify"
 name = "Telegram 通知"
-version = "1.0.2"
+version = "1.1.0"
 abi_version = 2
 subscribes = ["agent_offline", "agent_online", "plugin_expiry_soon"]
 
@@ -21,3 +21,41 @@ key = "chat_id"
 label = "目标会话 ID"
 required = true
 hint = "群为负数；先给机器人发一条消息，再从 getUpdates 的响应里取 chat id"
+
+# 消息模板:三类事件各一份,非必填。`default` 就是没配模板时真会发出去的那段文案
+# ——面板拿它预填,操作员改一个字即可;src/lib.rs 里的内置常量必须与它逐字一致
+# (tests/smoke.rs 有一条测试守着,漂移了面板显示的基准就不是插件真会发的东西)。
+# 模板按 HTML 写(TG 的 parse_mode=HTML):原文原样发出,插进来的字段值由插件转义。
+# `type = "textarea"` 让面板用多行编辑器渲染——多行是面板的通用能力,它不知道
+# 哪个字段是「模板」。
+
+[[kv]]
+key = "template_expiry_soon"
+label = "到期提醒文案"
+required = false
+type = "textarea"
+default = "⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天）"
+hint = "占位符：{name} {expires_at} {days_left} {threshold_days} {node_id}；可写 HTML，如 <b>粗体</b>"
+
+[[kv]]
+key = "template_agent_offline"
+label = "离线告警文案"
+required = false
+type = "textarea"
+default = "🔴 节点 {name} 已离线（最后上报于 {silent_for} 秒前）"
+hint = "占位符：{name} {silent_for} {observed_at} {last_seen_at} {node_id}"
+
+[[kv]]
+key = "template_agent_online"
+label = "上线恢复文案"
+required = false
+type = "textarea"
+default = "🟢 节点 {name} 已恢复在线"
+hint = "占位符：{name} {observed_at} {node_id}"
+
+# 「测试」的样例载荷:宿主自身的事件它自己造得出真实结构,插件事件(到期提醒由
+# 财务插件发出)宿主一无所知,只能回放这里给的那一份。字段要与财务插件真发的
+# 事件一致——少了哪个,插件解析就会失败,测试也就发不出去。
+[[sample]]
+name = "plugin_expiry_soon"
+payload = '{"node_id":0,"name":"test","expires_at":"2027-01-01","days_left":1,"threshold_days":1}'

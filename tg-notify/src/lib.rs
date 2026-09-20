@@ -17,6 +17,13 @@
 //! kv 命名空间是 `plugin.<plugin_id>:<key>`，`<plugin_id>` 取自 plugin.toml，
 //! key 里只要写 `bot_token` / `chat_id`。
 //!
+//! 文案本身也可配置：三类事件各有一份模板（`template_expiry_soon` /
+//! `template_agent_offline` / `template_agent_online`），用 `{字段}` 占位符插值。
+//! 没配模板的那类走代码里的内置文案——与模板上线之前发出的内容逐字相同，所以
+//! 升级不会改变已有部署看到的消息。模板按 Telegram 的 HTML 富样式写
+//! （`parse_mode: "HTML"`）；插值进去的字段值由插件转义，认不出的占位符原样
+//! 保留并打一条 warn——模板写错一个名字不该让整条通知消失。
+//!
 //! # on_event 的返回码
 //!
 //! | 码 | 含义 |
@@ -156,20 +163,144 @@ enum Event {
     },
 }
 
-/// 按事件类型渲染中文通知文案。
-fn render(event: &Event) -> String {
+// ---------------------------------------------------------------------------
+// 模板与内置文案
+// ---------------------------------------------------------------------------
+
+/// 三类事件的模板 kv key。与 plugin.toml 的 `[[kv]] key` 逐字一致。
+const TEMPLATE_EXPIRY_SOON: &str = "template_expiry_soon";
+const TEMPLATE_AGENT_OFFLINE: &str = "template_agent_offline";
+const TEMPLATE_AGENT_ONLINE: &str = "template_agent_online";
+
+/// 没配模板时用的内置文案。**必须与 plugin.toml 里对应 `[[kv]]` 的 `default`
+/// 逐字一致**——面板预填的就是那份,漂移了操作员看到的基准就不是插件真会发的
+/// 那段话。`tests/smoke.rs` 的漂移守卫测试拿实际发出的文案与 manifest 比对。
+const BUILTIN_EXPIRY_SOON: &str = "⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天）";
+const BUILTIN_AGENT_OFFLINE: &str = "🔴 节点 {name} 已离线（最后上报于 {silent_for} 秒前）";
+const BUILTIN_AGENT_ONLINE: &str = "🟢 节点 {name} 已恢复在线";
+
+/// kv 值的上限（宿主侧 `KV_VALUE_MAX`，8 KiB）。它不在 ABI 里，所以这里是手抄的
+/// 常量：模板最长可以到这个量级，读的时候缓冲给小了会**静默截断**——发出去的
+/// 消息少半句而没人报错，比读不到更难查。
+const KV_BUF_CAP: i32 = 8 * 1024;
+
+/// 一类事件的三件东西：模板的 kv key、内置文案、以及占位符取值。三样放在一处，
+/// 免得日后加了字段忘了在模板里露出来。
+fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, String)>) {
     match event {
-        Event::PluginExpirySoon { name, expires_at, days_left, .. } => {
-            format!("⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天）")
+        Event::PluginExpirySoon { node_id, name, expires_at, days_left, threshold_days } => (
+            TEMPLATE_EXPIRY_SOON,
+            BUILTIN_EXPIRY_SOON,
+            vec![
+                ("node_id", node_id.to_string()),
+                ("name", name.clone()),
+                ("expires_at", expires_at.clone()),
+                ("days_left", days_left.to_string()),
+                ("threshold_days", threshold_days.to_string()),
+            ],
+        ),
+        Event::AgentOffline { node_id, name, observed_at, last_seen_at } => {
+            // 静默时长向宿主要时钟算（wasm 里没有时钟）。负值取 0：时钟回拨时
+            // 不该出现「-3 秒前」这种消息。
+            let silent_for = (unsafe { host_now() } - last_seen_at).max(0);
+            (
+                TEMPLATE_AGENT_OFFLINE,
+                BUILTIN_AGENT_OFFLINE,
+                vec![
+                    ("node_id", node_id.to_string()),
+                    ("name", name.clone()),
+                    ("observed_at", observed_at.to_string()),
+                    ("last_seen_at", last_seen_at.to_string()),
+                    ("silent_for", silent_for.to_string()),
+                ],
+            )
         }
-        Event::AgentOffline { name, last_seen_at, .. } => {
-            // wasm 里没有时钟：当前时间向宿主要，静默时长算给人看。
-            let now = unsafe { host_now() };
-            let silent_for = (now - last_seen_at).max(0);
-            format!("🔴 节点 {name} 已离线（最后上报于 {silent_for} 秒前）")
-        }
-        Event::AgentOnline { name, .. } => format!("🟢 节点 {name} 已恢复在线"),
+        Event::AgentOnline { node_id, name, observed_at } => (
+            TEMPLATE_AGENT_ONLINE,
+            BUILTIN_AGENT_ONLINE,
+            vec![
+                ("node_id", node_id.to_string()),
+                ("name", name.clone()),
+                ("observed_at", observed_at.to_string()),
+            ],
+        ),
     }
+}
+
+/// 按事件类型渲染通知文案：配了模板就用模板，没配（无值或纯空白）用内置文案。
+///
+/// 插值进去的字段值做 HTML 转义——节点名是别人给的，一个 `<` 就能把消息结构改掉。
+/// 认不出的占位符原样保留，并**汇总成一条** warn（不逐个占位符刷日志）。
+fn render(event: &Event) -> String {
+    let (key, builtin, vars) = material(event);
+    let template = kv_get_string(key)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| builtin.to_owned());
+    let vars: Vec<(&str, String)> = vars.into_iter().map(|(k, v)| (k, escape_html(&v))).collect();
+    let (text, unknown) = substitute(&template, &vars);
+    if !unknown.is_empty() {
+        let known: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        log(
+            2,
+            &format!(
+                "tg-notify: 模板 {key} 里的占位符 {} 认不出，已原样保留；这条事件可用的是 {}",
+                unknown.join("、"),
+                known.join("、")
+            ),
+        );
+    }
+    text
+}
+
+/// 用 `{名字}` 占位符替换。认不出的原样留着——模板写错一个名字，消息还是发得出去。
+///
+/// 没有 `{` 的转义语法：认不出的占位符本来就原样保留，所以模板里写一个字面花括号
+/// 不会卡住（代价是写不出一个字面的 `{name}`）。
+fn substitute(template: &str, vars: &[(&str, String)]) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(template.len() + 64);
+    let mut unknown = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}') {
+            Some(close) => {
+                let name = &after[..close];
+                match vars.iter().find(|(key, _)| *key == name) {
+                    Some((_, value)) => out.push_str(value),
+                    None => {
+                        out.push('{');
+                        out.push_str(name);
+                        out.push('}');
+                        unknown.push(name.to_owned());
+                    }
+                }
+                rest = &after[close + 1..];
+            }
+            // 没收口的 `{`：原样留着，别把它之后整段都吞掉。
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, unknown)
+}
+
+/// 插值用的 HTML 转义。模板原文是作者按 HTML 写的、原样发出；值不是——节点名里
+/// 的 `<`、`&` 转义后写进去。只转这三个字符：Telegram 的 HTML 只认它们。
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -182,13 +313,18 @@ fn kv_get_string(key: &str) -> Option<String> {
     if kptr <= 0 {
         return None;
     }
-    // bot token 约 46 字节、chat_id 更短；512 字节绰绰有余。
-    let mut buf = [0u8; 512];
-    let n = unsafe { host_kv_get(kptr, klen, buf.as_mut_ptr() as i32, buf.len() as i32) };
+    // 值最长可以是 KV_BUF_CAP（模板就是这么用的），所以按上限读：栈上那点缓冲
+    // 会把长模板截断，而截断是静默的。
+    let buf = __alloc(KV_BUF_CAP);
+    if buf <= 0 {
+        return None;
+    }
+    let n = unsafe { host_kv_get(kptr, klen, buf, KV_BUF_CAP) };
     if n <= 0 {
         return None;
     }
-    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +364,7 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
     let body = json!({
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     });
     let body = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
 

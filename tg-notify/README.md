@@ -7,11 +7,22 @@ README 的「插件开发」章节，权威实现见 `src/plugin/`。
 
 ## 行为
 
-| 事件 | 文案 |
-|---|---|
-| `plugin_expiry_soon` | ⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天） |
-| `agent_offline` | 🔴 节点 {name} 已离线（最后上报于 N 秒前） |
-| `agent_online` | 🟢 节点 {name} 已恢复在线 |
+| 事件 | 内置文案（没配模板时） | 可用占位符 |
+|---|---|---|
+| `plugin_expiry_soon` | ⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天） | `{name}` `{expires_at}` `{days_left}` `{threshold_days}` `{node_id}` |
+| `agent_offline` | 🔴 节点 {name} 已离线（最后上报于 N 秒前） | `{name}` `{silent_for}` `{observed_at}` `{last_seen_at}` `{node_id}` |
+| `agent_online` | 🟢 节点 {name} 已恢复在线 | `{name}` `{observed_at}` `{node_id}` |
+
+三类文案都能在面板的「配置」里改（三个 `template_*` kv，都是非必填）：
+
+- 模板用 `{占位符}` 插值，**按 Telegram 的 HTML 富样式写**（插件用
+  `parse_mode: "HTML"` 发送），例如 `<b>{name}</b> 掉了`。模板原文原样发出；
+  插值进去的字段值由插件做 HTML 转义，节点名里的 `<`、`&` 不会破坏消息。
+- 没配（kv 没有这一行、值是空的、或只剩空白）就用上表的内置文案。面板的「配置」
+  里预填的就是这份内置文案并标注「未自定义」，改一个字即可，清空即回到内置。
+- 认不出的占位符会原样留在消息里，插件另外打一条 warn——写错一个名字不会让通知
+  消失。（因此没有 `{` 的转义写法：字面花括号也原样保留。）
+- `{silent_for}` 是现算的离线时长（秒）；时间类占位符给的是 Unix 秒，没有格式化。
 
 > ABI v2 起宿主的到期检测退役，`expiry_soon` 事件由财务统计插件经
 > `emit_event` 发出，事件名带 `plugin_` 前缀。未启用财务插件的部署不再有
@@ -59,15 +70,22 @@ cargo test
 
 1. 在管理面板「插件」页上传 `plugin.tar.gz`（等价于
    `POST /api/plugins`，multipart 的 `plugin` 字段）。上传后默认不启用。
-2. 点该行的「配置」，填 `plugin.toml` 里 `[[kv]]` 声明的两项（等价于
+2. 点该行的「配置」，填 `plugin.toml` 里 `[[kv]]` 声明的项（等价于
    `PUT /api/plugins/{id}/kv/{key}`，body `{"value": "..."}`）。对话框按声明
    显示标签、必填标记与提示，key 不用自己记：
    - `bot_token`：从 [@BotFather](https://t.me/BotFather) 拿到的 token
    - `chat_id`：目标会话 id（群为负数；可先给机器人发一条消息，再从
      `getUpdates` 的响应里找到 chat id）
-3. 点「启用」，再用「测试」自检——它会构造一条合成的 `plugin_expiry_soon`
-   事件，走与真实派发完全相同的执行路径。必填项没填时「测试」会直接告诉你
-   缺哪一项。
+   - `template_expiry_soon` / `template_agent_offline` / `template_agent_online`：
+     三类通知的文案（多行编辑器）。不填就用内置文案；`default` 会预填进去，
+     上面标着「未自定义」——改了才会真的存下来。
+3. 点「启用」，再用「测试」自检——它**按订阅逐条**合成事件并真派发，走与真实派发
+   完全相同的执行路径：本插件一次会发三条（`agent_offline`、`agent_online`、
+   `plugin_expiry_soon`），逐条结果显示在面板上。必填项没填时「测试」会直接告诉
+   你缺哪一项，一条都不发。
+   - `plugin_expiry_soon` 的载荷来自 `plugin.toml` 里声明的 `[[sample]]`：
+     宿主对别的插件的事件字段一无所知，只能回放插件给的样例。删掉那条声明，
+     这条就会显示「没有样例载荷，无法测试」。
 
    > 已安装过旧版的部署：库里的 manifest 是上传时抄的一份，`[[kv]]` 要
    > 生效得先删除旧版再上传（同名 `plugin_id` 重复上传会被拒）。
