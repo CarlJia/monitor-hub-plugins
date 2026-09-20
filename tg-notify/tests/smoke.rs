@@ -375,6 +375,26 @@ fn a_custom_template_is_rendered_with_escaped_values() {
     assert_eq!(last_body(&store)["parse_mode"], "HTML");
 }
 
+/// 时间类占位符渲染成带 UTC 标注的可读时间，不是原始 Unix 秒——操作员在模板里
+/// 写 {observed_at} / {last_seen_at} 想看到的是「什么时候」，不是一串数字。
+#[test]
+fn time_placeholders_render_as_utc_strings() {
+    let wasm = build_wasm();
+    let mut host = bare_host();
+    host.kv.insert(
+        "template_agent_offline".into(),
+        "{name} 最后上报于 {last_seen_at}，检测于 {observed_at}".into(),
+    );
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+
+    let payload = r#"{"type":"agent_offline","node_id":5,"name":"edge-1","observed_at":1800000000,"last_seen_at":1799999400}"#;
+    assert_eq!(send_event(&mut store, &instance, payload), 0);
+    assert_eq!(
+        last_text(&store),
+        "edge-1 最后上报于 2027-01-15 07:50 UTC，检测于 2027-01-15 08:00 UTC"
+    );
+}
+
 /// 认不出的占位符原样留在消息里、仍然派发成功，并打一条 warn——模板写错一个名字
 /// 不该让整条通知消失，那是「什么都没收到」级别的故障。
 #[test]

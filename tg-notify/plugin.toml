@@ -1,7 +1,7 @@
 # tg-notify 的 manifest。字段表见仓库 README 的「插件开发」章节。
 plugin_id = "com.example.tg-notify"
 name = "Telegram 通知"
-version = "1.1.0"
+version = "1.2.0"
 abi_version = 2
 subscribes = ["agent_offline", "agent_online", "plugin_expiry_soon"]
 
@@ -35,7 +35,7 @@ label = "到期提醒文案"
 required = false
 type = "textarea"
 default = "⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天）"
-hint = "占位符：{name} {expires_at} {days_left} {threshold_days} {node_id}；可写 HTML，如 <b>粗体</b>"
+hint = "占位符：{name}=节点名，{expires_at}=到期日期，{days_left}=剩余天数，{threshold_days}=提前提醒阈值（天），{node_id}=节点 ID；可写 HTML，如 <b>粗体</b>"
 
 [[kv]]
 key = "template_agent_offline"
@@ -43,7 +43,7 @@ label = "离线告警文案"
 required = false
 type = "textarea"
 default = "🔴 节点 {name} 已离线（最后上报于 {silent_for} 秒前）"
-hint = "占位符：{name} {silent_for} {observed_at} {last_seen_at} {node_id}"
+hint = "占位符：{name}=节点名，{silent_for}=已静默秒数，{observed_at}=检测到离线的时间（UTC），{last_seen_at}=最后上报时间（UTC），{node_id}=节点 ID"
 
 [[kv]]
 key = "template_agent_online"
@@ -51,7 +51,7 @@ label = "上线恢复文案"
 required = false
 type = "textarea"
 default = "🟢 节点 {name} 已恢复在线"
-hint = "占位符：{name} {observed_at} {node_id}"
+hint = "占位符：{name}=节点名，{observed_at}=检测到上线的时间（UTC），{node_id}=节点 ID"
 
 # 「测试」的样例载荷:宿主自身的事件它自己造得出真实结构,插件事件(到期提醒由
 # 财务插件发出)宿主一无所知,只能回放这里给的那一份。字段要与财务插件真发的

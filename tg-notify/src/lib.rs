@@ -36,6 +36,7 @@
 
 use std::ptr;
 
+use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -184,6 +185,15 @@ const BUILTIN_AGENT_ONLINE: &str = "🟢 节点 {name} 已恢复在线";
 /// 消息少半句而没人报错，比读不到更难查。
 const KV_BUF_CAP: i32 = 8 * 1024;
 
+/// Unix 秒 → 消息里的时间文案。wasm 里不知道读消息人的时区，带 UTC 标注的
+/// 绝对时间是唯一不产生歧义的写法；格式与 finance-stats 的到期/汇率文案一致。
+/// chrono 只做日期算术，时钟来自事件载荷本身。
+fn fmt_ts(secs: i64) -> String {
+    DateTime::from_timestamp(secs, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
 /// 一类事件的三件东西：模板的 kv key、内置文案、以及占位符取值。三样放在一处，
 /// 免得日后加了字段忘了在模板里露出来。
 fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, String)>) {
@@ -220,8 +230,8 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
                 vec![
                     ("node_id", node_id.to_string()),
                     ("name", name.clone()),
-                    ("observed_at", observed_at.to_string()),
-                    ("last_seen_at", last_seen_at.to_string()),
+                    ("observed_at", fmt_ts(*observed_at)),
+                    ("last_seen_at", fmt_ts(*last_seen_at)),
                     ("silent_for", silent_for.to_string()),
                 ],
             )
@@ -236,7 +246,7 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
             vec![
                 ("node_id", node_id.to_string()),
                 ("name", name.clone()),
-                ("observed_at", observed_at.to_string()),
+                ("observed_at", fmt_ts(*observed_at)),
             ],
         ),
     }
