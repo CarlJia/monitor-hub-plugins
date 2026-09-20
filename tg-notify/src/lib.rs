@@ -289,7 +289,10 @@ fn substitute(template: &str, vars: &[(&str, String)]) -> (String, Vec<String>) 
 }
 
 /// 插值用的 HTML 转义。模板原文是作者按 HTML 写的、原样发出；值不是——节点名里
-/// 的 `<`、`&` 转义后写进去。只转这三个字符：Telegram 的 HTML 只认它们。
+/// 的 `<`、`&` 都会破坏消息。`"` 也要转义：模板写在属性里（如
+/// `<a href="…{name}…">`）时,值里的引号会提前闭合属性、整条消息被 Telegram 拒
+/// 收——而「转义」的承诺让人以为这种情况已经被处理。只转这四个字符：Telegram 的
+/// HTML 解析认它们(`&quot;` 是标准实体,会按字面 `"` 解析)。
 fn escape_html(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -297,6 +300,7 @@ fn escape_html(value: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
             other => out.push(other),
         }
     }

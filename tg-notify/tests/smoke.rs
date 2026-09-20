@@ -367,10 +367,11 @@ fn a_custom_template_is_rendered_with_escaped_values() {
     );
     let (mut store, instance) = instantiate(&engine(), &wasm, host);
 
-    // 节点名是别人给的：一个 `<` 就能改掉消息结构，所以值进模板前必须转义。
-    let payload = r#"{"type":"agent_offline","node_id":5,"name":"<script>&","observed_at":1,"last_seen_at":1799999700}"#;
+    // 节点名是别人给的: `<` 与 `&` 会改坏消息结构; `"` 在属性里(如
+    // `<a href="…{name}…">`)也会提前闭合属性——三种都要转。
+    let payload = r#"{"type":"agent_offline","node_id":5,"name":"<script>&\"x","observed_at":1,"last_seen_at":1799999700}"#;
     assert_eq!(send_event(&mut store, &instance, payload), 0);
-    assert_eq!(last_text(&store), "<b>&lt;script&gt;&amp;</b> 掉了\n已静默 300 秒");
+    assert_eq!(last_text(&store), "<b>&lt;script&gt;&amp;&quot;x</b> 掉了\n已静默 300 秒");
     assert_eq!(last_body(&store)["parse_mode"], "HTML");
 }
 
