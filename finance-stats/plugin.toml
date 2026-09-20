@@ -5,7 +5,7 @@
 # 它自己发出的是 plugin_expiry_soon，由 tg-notify 订阅。
 plugin_id = "io.github.monitor.finance-stats"
 name = "财务统计"
-version = "1.2.0"
+version = "1.2.1"
 abi_version = 2
 subscribes = ["node_added", "node_deleted"]
 tick = true

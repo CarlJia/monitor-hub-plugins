@@ -6,7 +6,7 @@
 
 [package]
 name = "tg-notify"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "Telegram 通知示例插件（monitor-hub wasm 插件 ABI v2）"
@@ -28,6 +28,10 @@ serde_json = "1"
 # 冒烟测试（tests/smoke.rs）用 wasmtime 复刻宿主的 6 个宿主函数，把编译出的
 # 真实 wasm 加载起来驱动。features 与 hub（src/plugin.rs）保持同一最小集合。
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+# 漂移守卫要读 plugin.toml 里 `[[kv]]` 的 default 与实际发出的文案比对。手写一个
+# 迷你 TOML 扫描器只会让这条测试自己变成另一个可能出错的地方，所以用宿主同一版
+# 解析器（测试跑在宿主上，不进 wasm，也就不影响产物体积）。
+toml = "1"
 
 [profile.release]
 # 面向体积优化：示例插件的 wasm 越小，上传与加载越快。

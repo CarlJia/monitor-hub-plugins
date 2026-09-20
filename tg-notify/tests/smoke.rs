@@ -283,3 +283,125 @@ fn a_broken_payload_returns_an_error_code() {
     assert_eq!(send_event(&mut store, &instance, "not json"), 1);
     assert!(store.data().http_calls.lock().unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// 模板（v1.1.0）：读 kv 模板渲染、没配就用内置文案
+// ---------------------------------------------------------------------------
+
+/// 最后一条 sendMessage 的 JSON 体。模板里可能有换行，比对整个 body 字符串会被
+/// JSON 的 `\n` 转义绕进去，所以解出来再断言。
+fn last_body(store: &Store<Host>) -> serde_json::Value {
+    let calls = store.data().http_calls.lock().unwrap();
+    let call = calls.last().expect("应当发过一次 sendMessage");
+    serde_json::from_str(&call.body).expect("body 是 JSON")
+}
+
+/// 最后一条消息的文本。
+fn last_text(store: &Store<Host>) -> String {
+    last_body(store)["text"].as_str().expect("text 是字符串").to_owned()
+}
+
+/// plugin.toml 里某个 `[[kv]]` 声明的 default（面板预填给操作员的那份基准）。
+fn manifest_default(key: &str) -> String {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+        .expect("读 plugin.toml");
+    let parsed: toml::Value = toml::from_str(&text).expect("plugin.toml 是合法 TOML");
+    parsed["kv"]
+        .as_array()
+        .expect("[[kv]] 是数组")
+        .iter()
+        .find(|decl| decl["key"].as_str() == Some(key))
+        .and_then(|decl| decl["default"].as_str())
+        .unwrap_or_else(|| panic!("plugin.toml 里 `{key}` 应当声明 default"))
+        .to_owned()
+}
+
+/// 一个只配了渠道、没配模板的桩宿主。
+fn bare_host() -> Host {
+    let mut host = Host::default();
+    host.kv.insert("bot_token".into(), "t".into());
+    host.kv.insert("chat_id".into(), "c".into());
+    host
+}
+
+/// 漂移守卫：不配模板时真发出去的文案，必须与 plugin.toml 声明的那份 default
+/// 渲染出完全一样的结果。
+///
+/// 两处文案各有用途——manifest 的 default 是面板预填的基准，代码里的常量是没配
+/// 模板时真会发的东西——它们一旦漂移，操作员「改一个字」改的就不是插件真会发的
+/// 那段话，而这件事没有任何编译期信号。桩宿主的时钟是常量，两次运行看到的是同一
+/// 时刻，所以离线文案里算出来的静默时长也一致。
+#[test]
+fn built_in_text_behaves_exactly_like_the_manifest_default() {
+    let wasm = build_wasm();
+    let cases = [
+        (CASES[0].0, "template_expiry_soon"),
+        (CASES[1].0, "template_agent_offline"),
+        (CASES[2].0, "template_agent_online"),
+    ];
+    for (payload, key) in cases {
+        let (mut store, instance) = instantiate(&engine(), &wasm, bare_host());
+        assert_eq!(send_event(&mut store, &instance, payload), 0, "{key}");
+        let builtin = last_text(&store);
+
+        let mut declared = bare_host();
+        declared.kv.insert(key.into(), manifest_default(key));
+        let (mut store, instance) = instantiate(&engine(), &wasm, declared);
+        assert_eq!(send_event(&mut store, &instance, payload), 0, "{key}");
+        assert_eq!(
+            last_text(&store),
+            builtin,
+            "{key}：plugin.toml 的 default 与插件内置文案漂移了"
+        );
+    }
+}
+
+/// 自定义模板：多行原样保留，插值进去的字段值做 HTML 转义，解析模式是 HTML。
+#[test]
+fn a_custom_template_is_rendered_with_escaped_values() {
+    let wasm = build_wasm();
+    let mut host = bare_host();
+    host.kv.insert(
+        "template_agent_offline".into(),
+        "<b>{name}</b> 掉了\n已静默 {silent_for} 秒".into(),
+    );
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+
+    // 节点名是别人给的: `<` 与 `&` 会改坏消息结构; `"` 在属性里(如
+    // `<a href="…{name}…">`)也会提前闭合属性——三种都要转。
+    let payload = r#"{"type":"agent_offline","node_id":5,"name":"<script>&\"x","observed_at":1,"last_seen_at":1799999700}"#;
+    assert_eq!(send_event(&mut store, &instance, payload), 0);
+    assert_eq!(last_text(&store), "<b>&lt;script&gt;&amp;&quot;x</b> 掉了\n已静默 300 秒");
+    assert_eq!(last_body(&store)["parse_mode"], "HTML");
+}
+
+/// 认不出的占位符原样留在消息里、仍然派发成功，并打一条 warn——模板写错一个名字
+/// 不该让整条通知消失，那是「什么都没收到」级别的故障。
+#[test]
+fn an_unknown_placeholder_stays_and_warns() {
+    let wasm = build_wasm();
+    let mut host = bare_host();
+    host.kv.insert("template_agent_online".into(), "{nmae} 上线了".into());
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+
+    assert_eq!(send_event(&mut store, &instance, CASES[2].0), 0, "写错占位符不该让派发失败");
+    assert_eq!(last_text(&store), "{nmae} 上线了");
+    let logs = store.data().logs.lock().unwrap();
+    assert!(
+        logs.iter().any(|(level, text)| *level == 2 && text.contains("nmae")),
+        "要有一条点名该占位符的 warn：{logs:?}"
+    );
+}
+
+/// 模板是纯空白 = 没配：回退内置文案，与「kv 里没有这一行」完全一样（操作员清空
+/// 模板就是回到内置，不是发一条空白消息）。
+#[test]
+fn a_blank_template_falls_back_to_built_in() {
+    let wasm = build_wasm();
+    let mut host = bare_host();
+    host.kv.insert("template_agent_online".into(), "  \n ".into());
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+
+    assert_eq!(send_event(&mut store, &instance, CASES[2].0), 0);
+    assert_eq!(last_text(&store), CASES[2].1);
+}

@@ -258,10 +258,12 @@ fn default_threshold() -> i64 {
 
 impl Config {
     fn load() -> Config {
-        data_get("config").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| Config {
-            target_currency: default_target(),
-            threshold_days: default_threshold(),
-        })
+        data_get("config")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| Config {
+                target_currency: default_target(),
+                threshold_days: default_threshold(),
+            })
     }
     fn save(&self) {
         if let Ok(s) = serde_json::to_string(self) {
@@ -284,7 +286,9 @@ impl Config {
 /// 没配，回退到 `config` 记录：窗口判据是 `days_left <= 阈值`，0 或负数会让窗口
 /// 变空，"配了个静默失效的值"比回退到能用的默认更难查。
 fn threshold_from_kv() -> Option<i64> {
-    kv_get_string("threshold_days").and_then(|s| s.trim().parse::<i64>().ok()).filter(|d| *d > 0)
+    kv_get_string("threshold_days")
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|d| *d > 0)
 }
 
 /// 周期名 → 月数 → 下拉里的中文展示标签，顺序即下拉里的展示顺序。统计口径、
@@ -319,7 +323,10 @@ fn is_free(n: &NodeFin) -> bool {
 /// 计费周期 → 月数：全插件唯一的周期真源（下拉取值与标签也由它派生）。`once`
 /// 与 `free` 无周期（不滚动、不进年化）。
 fn cycle_months(cycle: &str) -> Option<u32> {
-    CYCLE_MONTHS.iter().find(|(name, _, _)| *name == cycle).map(|(_, months, _)| *months)
+    CYCLE_MONTHS
+        .iter()
+        .find(|(name, _, _)| *name == cycle)
+        .map(|(_, months, _)| *months)
 }
 
 fn today() -> NaiveDate {
@@ -431,7 +438,9 @@ fn reconcile_with(host: &[HostNode], known: Vec<(i64, NodeFin)>) -> Vec<(i64, No
             }
             Some(record) => {
                 // 宿主没回身份就不猜：留着记录，等宿主升级后下一轮再比。
-                let Some(created_at) = h.created_at else { continue };
+                let Some(created_at) = h.created_at else {
+                    continue;
+                };
                 match record.host_created_at {
                     None => {
                         let mut adopted = record.clone();
@@ -449,7 +458,11 @@ fn reconcile_with(host: &[HostNode], known: Vec<(i64, NodeFin)>) -> Vec<(i64, No
             }
         }
     }
-    let stale: Vec<i64> = by_id.keys().copied().filter(|id| !live.contains(id)).collect();
+    let stale: Vec<i64> = by_id
+        .keys()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect();
     for id in stale {
         data_delete(&node_key(id));
         by_id.remove(&id);
@@ -516,7 +529,10 @@ fn http_error_reason(code: i32) -> String {
 /// 拉取有多个入口（页面首屏 / 每小时 tick / 手动刷新），记录放在 `refresh_fx`
 /// 内部，谁触发都留痕——页面才不会只看得见"没拉过"而看不见"一直拉失败"。
 fn record_fx_failure(reason: String) {
-    let st = FxStatus { reason, attempted_at: unsafe { host_now() } };
+    let st = FxStatus {
+        reason,
+        attempted_at: unsafe { host_now() },
+    };
     if let Ok(s) = serde_json::to_string(&st) {
         data_put("fx_status", &s);
     }
@@ -532,7 +548,9 @@ fn load_fx_status() -> Option<FxStatus> {
 
 /// Unix 秒 → 页面上的时间文案（与汇率更新时间同格式）。
 fn fmt_ts(secs: i64) -> String {
-    DateTime::from_timestamp(secs, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()
+    DateTime::from_timestamp(secs, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default()
 }
 
 /// 拉一次汇率，以目标币种为 base。成功则更新缓存、清掉失败记录并返回 true；
@@ -559,14 +577,20 @@ fn refresh_fx(cfg: &Config) -> bool {
             return false;
         }
     };
-    let rates: HashMap<String, f64> =
-        v.get("rates").and_then(|r| serde_json::from_value(r.clone()).ok()).unwrap_or_default();
+    let rates: HashMap<String, f64> = v
+        .get("rates")
+        .and_then(|r| serde_json::from_value(r.clone()).ok())
+        .unwrap_or_default();
     if rates.is_empty() {
         log(2, "finance-stats: 汇率响应没有 rates");
         record_fx_failure("汇率响应里没有 rates 字段".to_owned());
         return false;
     }
-    let fx = Fx { base: base.clone(), rates, fetched_at: unsafe { host_now() } };
+    let fx = Fx {
+        base: base.clone(),
+        rates,
+        fetched_at: unsafe { host_now() },
+    };
     if let Ok(s) = serde_json::to_string(&fx) {
         data_put("fx", &s);
         clear_fx_failure();
@@ -603,7 +627,10 @@ fn convert(fx: &Fx, amount: f64, from: &str) -> Option<f64> {
     if from == fx.base {
         return Some(amount);
     }
-    fx.rates.get(from).filter(|r| **r != 0.0).map(|r| amount / r)
+    fx.rates
+        .get(from)
+        .filter(|r| **r != 0.0)
+        .map(|r| amount / r)
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +653,10 @@ fn remaining_value(n: &NodeFin, today: NaiveDate) -> Option<f64> {
     if is_free(n) {
         return None;
     }
-    let expires = n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok())?;
+    let expires = n
+        .expires_at
+        .as_deref()
+        .and_then(|d| d.parse::<NaiveDate>().ok())?;
     let days_left = (expires - today).num_days();
     if days_left <= 0 {
         return Some(0.0);
@@ -639,7 +669,10 @@ fn remaining_value(n: &NodeFin, today: NaiveDate) -> Option<f64> {
         }
         None => {
             // once：按购买日到到期日的总跨度折算。
-            let purchased = n.purchased_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok());
+            let purchased = n
+                .purchased_at
+                .as_deref()
+                .and_then(|d| d.parse::<NaiveDate>().ok());
             match purchased {
                 Some(p) => {
                     let total = (expires - p).num_days().max(1) as f64;
@@ -653,7 +686,11 @@ fn remaining_value(n: &NodeFin, today: NaiveDate) -> Option<f64> {
 
 /// 汇总：返回 (年化总成本, 剩余总价值) 在目标币种下的值；任一节点缺汇率
 /// 则该项跳过。fx 为 None 时返回 None（汇率不可用）。
-fn totals(fx: Option<&Fx>, nodes: &[(i64, NodeFin)], today: NaiveDate) -> Option<((f64, f64), Vec<String>)> {
+fn totals(
+    fx: Option<&Fx>,
+    nodes: &[(i64, NodeFin)],
+    today: NaiveDate,
+) -> Option<((f64, f64), Vec<String>)> {
     let fx = fx?;
     let mut annual = 0.0;
     let mut remaining = 0.0;
@@ -692,7 +729,11 @@ fn roll_if_online(id: i64, n: &mut NodeFin, online: &[i64], today: NaiveDate) ->
     let Some(months) = cycle_months(&n.billing_cycle) else {
         return false;
     };
-    let Some(exp) = n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {
+    let Some(exp) = n
+        .expires_at
+        .as_deref()
+        .and_then(|d| d.parse::<NaiveDate>().ok())
+    else {
         return false;
     };
     if exp >= today {
@@ -745,11 +786,21 @@ fn tick() {
     };
     for (id, mut n) in nodes {
         if roll_if_online(id, &mut n, &online, today) {
-            log(1, &format!("finance-stats: 节点 {} 到期日滚动到 {:?}", n.name, n.expires_at));
+            log(
+                1,
+                &format!(
+                    "finance-stats: 节点 {} 到期日滚动到 {:?}",
+                    n.name, n.expires_at
+                ),
+            );
             save_node(id, &n);
             continue; // 刚滚动的节点 days_left 变大，本轮不再提醒
         }
-        let Some(exp) = n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {
+        let Some(exp) = n
+            .expires_at
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok())
+        else {
             continue;
         };
         let days_left = (exp - today).num_days();
@@ -799,7 +850,10 @@ const CURRENCIES: [(&str, &str); 12] = [
 
 /// 币种 → 符号。表外币种（历史 config 里可能留着的取值）没有符号。
 fn currency_symbol(code: &str) -> Option<&'static str> {
-    CURRENCIES.iter().find(|(c, _)| *c == code).map(|(_, symbol)| *symbol)
+    CURRENCIES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, symbol)| *symbol)
 }
 
 /// 价格列显示的前缀：认得的币种给符号，认不得的退回代码本身——总比什么都不放
@@ -851,7 +905,10 @@ fn cycle_options() -> Vec<Value> {
 fn unrecognised_cycles(nodes: &[(i64, NodeFin)]) -> Vec<String> {
     let mut bad: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (_, n) in nodes {
-        if n.billing_cycle != ONCE && n.billing_cycle != FREE && cycle_months(&n.billing_cycle).is_none() {
+        if n.billing_cycle != ONCE
+            && n.billing_cycle != FREE
+            && cycle_months(&n.billing_cycle).is_none()
+        {
             bad.insert(n.billing_cycle.clone());
         }
     }
@@ -923,7 +980,8 @@ fn build_page(allow_fetch: bool) -> Value {
             let text = match &failure {
                 Some(st) => format!(
                     "汇率不可用——尚未成功拉取过汇率，统计暂缺；最近一次尝试 {} 失败：{}",
-                    fmt_ts(st.attempted_at), st.reason
+                    fmt_ts(st.attempted_at),
+                    st.reason
                 ),
                 None => "汇率不可用——尚未成功拉取过汇率，统计暂缺".to_owned(),
             };
@@ -983,8 +1041,11 @@ fn build_page(allow_fetch: bool) -> Value {
     let mut due: Vec<Value> = Vec::new();
     let mut all: Vec<Value> = Vec::new();
     for (id, n) in &nodes {
-        let days_left =
-            n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|e| (e - today).num_days());
+        let days_left = n
+            .expires_at
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok())
+            .map(|e| (e - today).num_days());
         let free = is_free(n);
         all.push(json!({
             "id": id,
@@ -1009,7 +1070,11 @@ fn build_page(allow_fetch: bool) -> Value {
             }
         }
     }
-    due.sort_by_key(|v| v.get("days_left").and_then(|d| d.as_i64()).unwrap_or(i64::MAX));
+    due.sort_by_key(|v| {
+        v.get("days_left")
+            .and_then(|d| d.as_i64())
+            .unwrap_or(i64::MAX)
+    });
     blocks.push(json!({
         "type": "table",
         "title": format!("{window} 天内到期（{}）", due.len()),
@@ -1089,7 +1154,11 @@ fn handle_action(input: &str) -> Value {
                 n.billing_cycle = v.to_owned();
             }
             if let Some(v) = req.get("expires_at").and_then(|v| v.as_str()) {
-                n.expires_at = if v.is_empty() { None } else { Some(v.to_owned()) };
+                n.expires_at = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_owned())
+                };
             }
             save_node(id, &n);
             with_toast(build_page(false), "success", "已保存")
@@ -1120,7 +1189,10 @@ enum NodeEvent {
         created_at: Option<i64>,
     },
     /// 节点行被删除。`name` 本插件不读，故不解析。
-    NodeDeleted { node_id: i64, created_at: Option<i64> },
+    NodeDeleted {
+        node_id: i64,
+        created_at: Option<i64>,
+    },
 }
 
 /// 宿主事件入口：`node_added` / `node_deleted`，启用期间实时同步。
@@ -1134,8 +1206,15 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
 }
 
 fn handle_node_event(input: &str) {
+    // 面板的「测试」会合成 `node_id: 0` 的事件（真实节点 id 为正，见宿主
+    // `api_plugins::synthetic_events`）。合成事件走的正是这条真实的数据写分支：
+    // 不挡住的话，一次自检就在财务页留下一行名为 test 的假节点。
     match serde_json::from_str::<NodeEvent>(input) {
-        Ok(NodeEvent::NodeAdded { node_id, name, created_at }) => {
+        Ok(NodeEvent::NodeAdded {
+            node_id,
+            name,
+            created_at,
+        }) if node_id > 0 => {
             // 身份相同 = 这台机器已经建过记录了（事件重投或迟到），什么都不做，
             // 否则会把操作员刚填好的价格抹回空白；身份不同（或记录缺失）才写空白
             // 记录——那时已有记录只可能属于被删掉的旧机器（id 被复用）。
@@ -1144,7 +1223,10 @@ fn handle_node_event(input: &str) {
                 save_node(node_id, &blank_node(name, created_at));
             }
         }
-        Ok(NodeEvent::NodeDeleted { node_id, created_at }) => {
+        Ok(NodeEvent::NodeDeleted {
+            node_id,
+            created_at,
+        }) if node_id > 0 => {
             // 事件异步派发，可能与复用同一 id 的 node_added 乱序；身份不符就当
             // 没发生过，否则会误删新节点的记录。
             let stored = load_node(node_id).and_then(|n| n.host_created_at);
@@ -1152,7 +1234,8 @@ fn handle_node_event(input: &str) {
                 data_delete(&node_key(node_id));
             }
         }
-        Err(_) => {}
+        // 认不出的载荷、以及 node_id 不合法的合成事件：一条都不写。
+        _ => {}
     }
 }
 
