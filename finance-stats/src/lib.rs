@@ -1134,8 +1134,11 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
 }
 
 fn handle_node_event(input: &str) {
+    // 面板的「测试」会合成 `node_id: 0` 的事件（真实节点 id 为正，见宿主
+    // `api_plugins::synthetic_events`）。合成事件走的正是这条真实的数据写分支：
+    // 不挡住的话，一次自检就在财务页留下一行名为 test 的假节点。
     match serde_json::from_str::<NodeEvent>(input) {
-        Ok(NodeEvent::NodeAdded { node_id, name, created_at }) => {
+        Ok(NodeEvent::NodeAdded { node_id, name, created_at }) if node_id > 0 => {
             // 身份相同 = 这台机器已经建过记录了（事件重投或迟到），什么都不做，
             // 否则会把操作员刚填好的价格抹回空白；身份不同（或记录缺失）才写空白
             // 记录——那时已有记录只可能属于被删掉的旧机器（id 被复用）。
@@ -1144,7 +1147,7 @@ fn handle_node_event(input: &str) {
                 save_node(node_id, &blank_node(name, created_at));
             }
         }
-        Ok(NodeEvent::NodeDeleted { node_id, created_at }) => {
+        Ok(NodeEvent::NodeDeleted { node_id, created_at }) if node_id > 0 => {
             // 事件异步派发，可能与复用同一 id 的 node_added 乱序；身份不符就当
             // 没发生过，否则会误删新节点的记录。
             let stored = load_node(node_id).and_then(|n| n.host_created_at);
@@ -1152,7 +1155,8 @@ fn handle_node_event(input: &str) {
                 data_delete(&node_key(node_id));
             }
         }
-        Err(_) => {}
+        // 认不出的载荷、以及 node_id 不合法的合成事件：一条都不写。
+        _ => {}
     }
 }
 

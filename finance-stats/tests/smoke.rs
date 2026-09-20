@@ -1754,3 +1754,28 @@ fn refresh_fx_failure_toast_mentions_cache_and_reason() {
     assert_eq!(store.data().data.lock().unwrap()["fx"], fx_record("CNY", NOW - 86_400));
 }
 
+/// 面板的「测试」会合成 `node_id: 0` 的事件（真实节点 id 为正）：这类事件必须被
+/// 忽略。合成事件走的正是真实的数据写分支，不挡住的话一次自检就在财务页留下一行
+/// 名为 test 的假节点——一个测试按钮顺手改了数据，是最难解释的那类副作用。
+#[test]
+fn synthetic_test_events_are_ignored() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let (mut store, instance) = instantiate(&engine, &wasm, Host::default());
+
+    dispatch_event(&mut store, &instance, &node_added_event(0, "test", NOW));
+    assert!(
+        !store.data().data.lock().unwrap().contains_key("node:0"),
+        "合成事件不该建出记录：{:?}",
+        store.data().data.lock().unwrap()
+    );
+    dispatch_event(&mut store, &instance, &node_deleted_event(0, NOW));
+    assert!(store.data().data.lock().unwrap().is_empty(), "合成事件也不该删掉任何东西");
+
+    // 回归：真实 id 照旧（这一对先建后删，净效果为零，正是宿主测试派发的那一组）。
+    dispatch_event(&mut store, &instance, &node_added_event(7, "edge-7", 1_700_000_007));
+    assert!(store.data().data.lock().unwrap().contains_key("node:7"), "真实 id 照旧建记录");
+    dispatch_event(&mut store, &instance, &node_deleted_event(7, 1_700_000_007));
+    assert!(!store.data().data.lock().unwrap().contains_key("node:7"), "真实 id 照旧按身份删");
+}
+
