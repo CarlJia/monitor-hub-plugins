@@ -188,7 +188,13 @@ const KV_BUF_CAP: i32 = 8 * 1024;
 /// 免得日后加了字段忘了在模板里露出来。
 fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, String)>) {
     match event {
-        Event::PluginExpirySoon { node_id, name, expires_at, days_left, threshold_days } => (
+        Event::PluginExpirySoon {
+            node_id,
+            name,
+            expires_at,
+            days_left,
+            threshold_days,
+        } => (
             TEMPLATE_EXPIRY_SOON,
             BUILTIN_EXPIRY_SOON,
             vec![
@@ -199,7 +205,12 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
                 ("threshold_days", threshold_days.to_string()),
             ],
         ),
-        Event::AgentOffline { node_id, name, observed_at, last_seen_at } => {
+        Event::AgentOffline {
+            node_id,
+            name,
+            observed_at,
+            last_seen_at,
+        } => {
             // 静默时长向宿主要时钟算（wasm 里没有时钟）。负值取 0：时钟回拨时
             // 不该出现「-3 秒前」这种消息。
             let silent_for = (unsafe { host_now() } - last_seen_at).max(0);
@@ -215,7 +226,11 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
                 ],
             )
         }
-        Event::AgentOnline { node_id, name, observed_at } => (
+        Event::AgentOnline {
+            node_id,
+            name,
+            observed_at,
+        } => (
             TEMPLATE_AGENT_ONLINE,
             BUILTIN_AGENT_ONLINE,
             vec![
@@ -236,7 +251,10 @@ fn render(event: &Event) -> String {
     let template = kv_get_string(key)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| builtin.to_owned());
-    let vars: Vec<(&str, String)> = vars.into_iter().map(|(k, v)| (k, escape_html(&v))).collect();
+    let vars: Vec<(&str, String)> = vars
+        .into_iter()
+        .map(|(k, v)| (k, escape_html(&v)))
+        .collect();
     let (text, unknown) = substitute(&template, &vars);
     if !unknown.is_empty() {
         let known: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
@@ -354,11 +372,17 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
     // 2) 读渠道配置。没配置是操作员可修复的状态：返回明确的错误码而不是
     //    静默成功——静默成功会让"通知没发出去"变成一个谜。
     let Some(token) = kv_get_string("bot_token") else {
-        log(2, "tg-notify: kv 里没有 bot_token；请在面板的插件 KV 编辑器里填写");
+        log(
+            2,
+            "tg-notify: kv 里没有 bot_token；请在面板的插件 KV 编辑器里填写",
+        );
         return 2;
     };
     let Some(chat_id) = kv_get_string("chat_id") else {
-        log(2, "tg-notify: kv 里没有 chat_id；请在面板的插件 KV 编辑器里填写");
+        log(
+            2,
+            "tg-notify: kv 里没有 chat_id；请在面板的插件 KV 编辑器里填写",
+        );
         return 3;
     };
 
@@ -385,7 +409,9 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
 
     // 4) 发送。返回负数是宿主错误码：10 - code 落在 11..=19，与其它错误码错开。
     let n = unsafe {
-        host_http_post(method_ptr, method_len, url_ptr, url_len, body_ptr, body_len, resp_ptr, RESP_CAP)
+        host_http_post(
+            method_ptr, method_len, url_ptr, url_len, body_ptr, body_len, resp_ptr, RESP_CAP,
+        )
     };
     if n < 0 {
         log(3, &format!("tg-notify: sendMessage 失败，宿主错误码 {n}（-1 越界 -2 非 https -3 非 POST -4 网络 -5 非 2xx -9 私有地址被拒）"));
