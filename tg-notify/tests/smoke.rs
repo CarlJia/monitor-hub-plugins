@@ -375,10 +375,11 @@ fn a_custom_template_is_rendered_with_escaped_values() {
     assert_eq!(last_body(&store)["parse_mode"], "HTML");
 }
 
-/// 时间类占位符渲染成带 UTC 标注的可读时间，不是原始 Unix 秒——操作员在模板里
-/// 写 {observed_at} / {last_seen_at} 想看到的是「什么时候」，不是一串数字。
+/// 时间类占位符渲染成带时区标注的可读时间，不是原始 Unix 秒——操作员在模板里
+/// 写 {observed_at} / {last_seen_at} 想看到的是「什么时候」，不是一串数字。没配
+/// tz_offset 时按默认东八区显示。
 #[test]
-fn time_placeholders_render_as_utc_strings() {
+fn time_placeholders_render_in_the_configured_timezone() {
     let wasm = build_wasm();
     let mut host = bare_host();
     host.kv.insert(
@@ -391,8 +392,64 @@ fn time_placeholders_render_as_utc_strings() {
     assert_eq!(send_event(&mut store, &instance, payload), 0);
     assert_eq!(
         last_text(&store),
-        "edge-1 最后上报于 2027-01-15 07:50 UTC，检测于 2027-01-15 08:00 UTC"
+        "edge-1 最后上报于 2027-01-15 15:50 UTC+8，检测于 2027-01-15 16:00 UTC+8"
     );
+}
+
+/// 配了 tz_offset 就按它换算：负偏移与半小时偏移都支持，标注跟着变。
+#[test]
+fn tz_offset_shifts_the_displayed_time() {
+    let wasm = build_wasm();
+    let payload = r#"{"type":"agent_online","node_id":5,"name":"edge-1","observed_at":1800000000}"#;
+
+    let mut host = bare_host();
+    host.kv.insert("template_agent_online".into(), "{observed_at}".into());
+    host.kv.insert("tz_offset".into(), "-5".into());
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+    assert_eq!(send_event(&mut store, &instance, payload), 0);
+    assert_eq!(last_text(&store), "2027-01-15 03:00 UTC-5");
+
+    let mut host = bare_host();
+    host.kv.insert("template_agent_online".into(), "{observed_at}".into());
+    host.kv.insert("tz_offset".into(), "5.5".into());
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+    assert_eq!(send_event(&mut store, &instance, payload), 0);
+    assert_eq!(last_text(&store), "2027-01-15 13:30 UTC+5:30");
+}
+
+/// tz_offset 填了不合法的值：回退东八区并打 warn，通知照发——一个写错的时区
+/// 不该让消息消失。
+#[test]
+fn an_invalid_tz_offset_falls_back_to_utc_plus_8_and_warns() {
+    let wasm = build_wasm();
+    let mut host = bare_host();
+    host.kv.insert("template_agent_online".into(), "{observed_at}".into());
+    host.kv.insert("tz_offset".into(), "下午三点半".into());
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+
+    assert_eq!(send_event(&mut store, &instance, CASES[2].0), 0);
+    assert_eq!(last_text(&store), "1970-01-01 08:05 UTC+8");
+    let logs = store.data().logs.lock().unwrap();
+    assert!(
+        logs.iter().any(|(level, text)| *level == 2 && text.contains("tz_offset")),
+        "要有一条点名 tz_offset 的 warn：{logs:?}"
+    );
+}
+
+/// tz_offset 是纯空白 = 没配：回退东八区且**不打** warn——面板「清空保存」写
+/// 进去的就是空串，那是一次有意的重置，不是配置错误。
+#[test]
+fn a_blank_tz_offset_is_unset_not_invalid() {
+    let wasm = build_wasm();
+    let mut host = bare_host();
+    host.kv.insert("template_agent_online".into(), "{observed_at}".into());
+    host.kv.insert("tz_offset".into(), "  \n ".into());
+    let (mut store, instance) = instantiate(&engine(), &wasm, host);
+
+    assert_eq!(send_event(&mut store, &instance, CASES[2].0), 0);
+    assert_eq!(last_text(&store), "1970-01-01 08:05 UTC+8");
+    let logs = store.data().logs.lock().unwrap();
+    assert!(!logs.iter().any(|(_, text)| text.contains("tz_offset")), "{logs:?}");
 }
 
 /// 认不出的占位符原样留在消息里、仍然派发成功，并打一条 warn——模板写错一个名字
