@@ -185,18 +185,60 @@ const BUILTIN_AGENT_ONLINE: &str = "🟢 节点 {name} 已恢复在线";
 /// 消息少半句而没人报错，比读不到更难查。
 const KV_BUF_CAP: i32 = 8 * 1024;
 
-/// Unix 秒 → 消息里的时间文案。wasm 里不知道读消息人的时区，带 UTC 标注的
-/// 绝对时间是唯一不产生歧义的写法；格式与 finance-stats 的到期/汇率文案一致。
-/// chrono 只做日期算术，时钟来自事件载荷本身。
-fn fmt_ts(secs: i64) -> String {
-    DateTime::from_timestamp(secs, 0)
-        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+/// 时区偏移的 kv key。与 plugin.toml 的 `[[kv]] key` 逐字一致。
+const TZ_OFFSET: &str = "tz_offset";
+
+/// 读时区偏移（相对 UTC 的小时数，支持半小时如 5.5），换算成秒。没配、空白、
+/// 非法或越界都回东八区 +8——与面板 `default` 预填的基准一致；非法值另外打一
+/// 条 warn（空白不算：面板「清空保存」写进去的就是空串，那是有意的重置）。
+/// 写错时区不该让通知消失。
+fn tz_offset_secs() -> i32 {
+    const DEFAULT_SECS: i32 = 8 * 3600;
+    let Some(raw) = kv_get_string(TZ_OFFSET) else {
+        return DEFAULT_SECS;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return DEFAULT_SECS;
+    }
+    match raw.parse::<f64>() {
+        Ok(hours) if (-12.0..=14.0).contains(&hours) => (hours * 3600.0).round() as i32,
+        _ => {
+            log(
+                2,
+                &format!("tg-notify: tz_offset「{raw}」不是合法的时区偏移（-12 到 14 的小时数），按东八区处理"),
+            );
+            DEFAULT_SECS
+        }
+    }
+}
+
+/// Unix 秒 → 消息里的时间文案：按 tz_offset 换算后带时区标注显示，如
+/// `2026-09-20 16:00 UTC+8`。wasm 里拿不到系统时区，偏移完全由配置决定（缺省
+/// 东八区）。chrono 只做日期算术，时钟来自事件载荷本身。
+fn fmt_ts(secs: i64, tz_secs: i32) -> String {
+    DateTime::from_timestamp(secs + tz_secs as i64, 0)
+        .map(|d| format!("{} {}", d.format("%Y-%m-%d %H:%M"), tz_label(tz_secs)))
         .unwrap_or_default()
+}
+
+/// 偏移秒数 → `UTC+8` / `UTC-5` / `UTC+5:30` 这样的标注。整点不带分钟。
+fn tz_label(tz_secs: i32) -> String {
+    let sign = if tz_secs < 0 { '-' } else { '+' };
+    let abs = tz_secs.abs();
+    let (h, m) = (abs / 3600, (abs % 3600) / 60);
+    if m == 0 {
+        format!("UTC{sign}{h}")
+    } else {
+        format!("UTC{sign}{h}:{m:02}")
+    }
 }
 
 /// 一类事件的三件东西：模板的 kv key、内置文案、以及占位符取值。三样放在一处，
 /// 免得日后加了字段忘了在模板里露出来。
 fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, String)>) {
+    // 时间类占位符的显示时区：每条事件读一次配置，没配即东八区。
+    let tz = tz_offset_secs();
     match event {
         Event::PluginExpirySoon {
             node_id,
@@ -230,8 +272,8 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
                 vec![
                     ("node_id", node_id.to_string()),
                     ("name", name.clone()),
-                    ("observed_at", fmt_ts(*observed_at)),
-                    ("last_seen_at", fmt_ts(*last_seen_at)),
+                    ("observed_at", fmt_ts(*observed_at, tz)),
+                    ("last_seen_at", fmt_ts(*last_seen_at, tz)),
                     ("silent_for", silent_for.to_string()),
                 ],
             )
@@ -246,7 +288,7 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
             vec![
                 ("node_id", node_id.to_string()),
                 ("name", name.clone()),
-                ("observed_at", fmt_ts(*observed_at)),
+                ("observed_at", fmt_ts(*observed_at, tz)),
             ],
         ),
     }

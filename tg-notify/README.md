@@ -23,8 +23,9 @@ README 的「插件开发」章节，权威实现见 `src/plugin/`。
 - 认不出的占位符会原样留在消息里，插件另外打一条 warn——写错一个名字不会让通知
   消失。（因此没有 `{` 的转义写法：字面花括号也原样保留。）
 - `{silent_for}` 是现算的离线时长（秒）；`{observed_at}` / `{last_seen_at}`
-  渲染成带 UTC 标注的可读时间（`2026-09-20 12:34 UTC`，与财务插件的到期文案
-  同格式）。插件不知道读消息人的时区，所以不做本地化换算。
+  渲染成带时区标注的可读时间（如 `2026-09-20 16:00 UTC+8`）。显示时区由
+  `tz_offset` 配置决定，默认东八区；填相对 UTC 的小时数（`8`、`-5`、`5.5`
+  都行），非法值按东八区处理并打一条 warn。
 
 > ABI v2 起宿主的到期检测退役，`expiry_soon` 事件由财务统计插件经
 > `emit_event` 发出，事件名带 `plugin_` 前缀。未启用财务插件的部署不再有
@@ -78,6 +79,8 @@ cargo test
    - `bot_token`：从 [@BotFather](https://t.me/BotFather) 拿到的 token
    - `chat_id`：目标会话 id（群为负数；可先给机器人发一条消息，再从
      `getUpdates` 的响应里找到 chat id）
+   - `tz_offset`：时间类占位符的显示时区，相对 UTC 的小时数（默认 8，
+     即东八区）
    - `template_expiry_soon` / `template_agent_offline` / `template_agent_online`：
      三类通知的文案（多行编辑器）。不填就用内置文案；`default` 会预填进去，
      上面标着「未自定义」——改了才会真的存下来。
