@@ -11,14 +11,15 @@
 //! 3. 在 `on_event(ptr, len)` 里解析事件 JSON，读自己的 kv 配置，发一次
 //!    https POST，返回 0 表示成功。
 //!
-//! 本插件订阅宿主的离线/在线事件与财务插件发出的 `plugin_expiry_soon`，
-//! 把通知渲染成中文文案发到 Telegram 的 `sendMessage`。渠道配置（bot_token
-//! / chat_id）由面板的 kv 编辑器写入，运行时经 `host_kv_get` 读取——插件的
-//! kv 命名空间是 `plugin.<plugin_id>:<key>`，`<plugin_id>` 取自 plugin.toml，
-//! key 里只要写 `bot_token` / `chat_id`。
+//! 本插件订阅宿主的离线/在线事件、面板登录成功/失败事件,以及财务插件发出的
+//! `plugin_expiry_soon`,把通知渲染成中文文案发到 Telegram 的 `sendMessage`。
+//! 渠道配置（bot_token / chat_id）由面板的 kv 编辑器写入，运行时经 `host_kv_get`
+//! 读取——插件的 kv 命名空间是 `plugin.<plugin_id>:<key>`，`<plugin_id>` 取自
+//! plugin.toml，key 里只要写 `bot_token` / `chat_id`。
 //!
-//! 文案本身也可配置：三类事件各有一份模板（`template_expiry_soon` /
-//! `template_agent_offline` / `template_agent_online`），用 `{字段}` 占位符插值。
+//! 文案本身也可配置：每类事件各有一份模板（`template_expiry_soon` /
+//! `template_agent_offline` / `template_agent_online` / `template_login_succeeded`
+//! / `template_login_failed`），用 `{字段}` 占位符插值。
 //! 没配模板的那类走代码里的内置文案——与模板上线之前发出的内容逐字相同，所以
 //! 升级不会改变已有部署看到的消息。模板按 Telegram 的 HTML 富样式写
 //! （`parse_mode: "HTML"`）；插值进去的字段值由插件转义，认不出的占位符原样
@@ -162,6 +163,22 @@ enum Event {
         name: String,
         observed_at: i64,
     },
+    /// 面板登录成功。`method` 是渠道(`password` / `github`),`actor` 是登录主体
+    /// （GitHub 用户名；应急密码没有账号，宿主发空串），`ip` 是发起端地址。
+    LoginSucceeded {
+        method: String,
+        actor: String,
+        ip: String,
+        observed_at: i64,
+    },
+    /// 面板登录失败。`reason` 是宿主给出的原因文案（密码错、GitHub 不在白名单、
+    /// state 不匹配等），`ip` 是发起端地址。
+    LoginFailed {
+        method: String,
+        reason: String,
+        ip: String,
+        observed_at: i64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +189,8 @@ enum Event {
 const TEMPLATE_EXPIRY_SOON: &str = "template_expiry_soon";
 const TEMPLATE_AGENT_OFFLINE: &str = "template_agent_offline";
 const TEMPLATE_AGENT_ONLINE: &str = "template_agent_online";
+const TEMPLATE_LOGIN_SUCCEEDED: &str = "template_login_succeeded";
+const TEMPLATE_LOGIN_FAILED: &str = "template_login_failed";
 
 /// 没配模板时用的内置文案。**必须与 plugin.toml 里对应 `[[kv]]` 的 `default`
 /// 逐字一致**——面板预填的就是那份,漂移了操作员看到的基准就不是插件真会发的
@@ -179,6 +198,8 @@ const TEMPLATE_AGENT_ONLINE: &str = "template_agent_online";
 const BUILTIN_EXPIRY_SOON: &str = "⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天）";
 const BUILTIN_AGENT_OFFLINE: &str = "🔴 节点 {name} 已离线（最后上报于 {silent_for} 秒前）";
 const BUILTIN_AGENT_ONLINE: &str = "🟢 节点 {name} 已恢复在线";
+const BUILTIN_LOGIN_SUCCEEDED: &str = "✅ 面板登录成功（{method}）{actor}，来自 {ip}，时间 {observed_at}";
+const BUILTIN_LOGIN_FAILED: &str = "⚠️ 面板登录失败（{method}），来自 {ip}，时间 {observed_at}；原因：{reason}";
 
 /// kv 值的上限（宿主侧 `KV_VALUE_MAX`，8 KiB）。它不在 ABI 里，所以这里是手抄的
 /// 常量：模板最长可以到这个量级，读的时候缓冲给小了会**静默截断**——发出去的
@@ -288,6 +309,36 @@ fn material(event: &Event) -> (&'static str, &'static str, Vec<(&'static str, St
             vec![
                 ("node_id", node_id.to_string()),
                 ("name", name.clone()),
+                ("observed_at", fmt_ts(*observed_at, tz)),
+            ],
+        ),
+        Event::LoginSucceeded {
+            method,
+            actor,
+            ip,
+            observed_at,
+        } => (
+            TEMPLATE_LOGIN_SUCCEEDED,
+            BUILTIN_LOGIN_SUCCEEDED,
+            vec![
+                ("method", method.clone()),
+                ("actor", actor.clone()),
+                ("ip", ip.clone()),
+                ("observed_at", fmt_ts(*observed_at, tz)),
+            ],
+        ),
+        Event::LoginFailed {
+            method,
+            reason,
+            ip,
+            observed_at,
+        } => (
+            TEMPLATE_LOGIN_FAILED,
+            BUILTIN_LOGIN_FAILED,
+            vec![
+                ("method", method.clone()),
+                ("reason", reason.clone()),
+                ("ip", ip.clone()),
                 ("observed_at", fmt_ts(*observed_at, tz)),
             ],
         ),

@@ -1,9 +1,15 @@
 # tg-notify 的 manifest。字段表见仓库 README 的「插件开发」章节。
 plugin_id = "com.example.tg-notify"
 name = "Telegram 通知"
-version = "1.3.0"
+version = "1.4.0"
 abi_version = 2
-subscribes = ["agent_offline", "agent_online", "plugin_expiry_soon"]
+subscribes = [
+  "agent_offline",
+  "agent_online",
+  "login_succeeded",
+  "login_failed",
+  "plugin_expiry_soon",
+]
 
 # 渠道配置。面板的「配置」对话框按这里渲染标签、必填标记与填写提示,并在点
 # 「测试」前预检必填项——缺项会直接 400 点名,而不是等插件回一个 other:2。
@@ -62,6 +68,22 @@ required = false
 type = "textarea"
 default = "🟢 节点 {name} 已恢复在线"
 hint = "占位符：{name}=节点名，{observed_at}=检测到上线的时间（按 tz_offset 时区显示），{node_id}=节点 ID"
+
+[[kv]]
+key = "template_login_succeeded"
+label = "登录成功文案"
+required = false
+type = "textarea"
+default = "✅ 面板登录成功（{method}）{actor}，来自 {ip}，时间 {observed_at}"
+hint = "占位符：{method}=登录渠道（password/github），{actor}=登录主体（GitHub 用户名；应急密码为空），{ip}=来源地址，{observed_at}=登录时间（按 tz_offset 时区显示）"
+
+[[kv]]
+key = "template_login_failed"
+label = "登录失败文案"
+required = false
+type = "textarea"
+default = "⚠️ 面板登录失败（{method}），来自 {ip}，时间 {observed_at}；原因：{reason}"
+hint = "占位符：{method}=登录渠道（password/github），{reason}=失败原因，{ip}=来源地址，{observed_at}=登录时间（按 tz_offset 时区显示）"
 
 # 「测试」的样例载荷:宿主自身的事件它自己造得出真实结构,插件事件(到期提醒由
 # 财务插件发出)宿主一无所知,只能回放这里给的那一份。字段要与财务插件真发的

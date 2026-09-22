@@ -225,11 +225,19 @@ const CASES: &[(&str, &str)] = &[
         "🔴 节点 edge-1 已离线",
     ),
     (r#"{"type":"agent_online","node_id":5,"name":"edge-1","observed_at":300}"#, "🟢 节点 edge-1 已恢复在线"),
+    (
+        r#"{"type":"login_succeeded","method":"github","actor":"carl","ip":"203.0.113.7","observed_at":300}"#,
+        "✅ 面板登录成功（github）carl，来自 203.0.113.7",
+    ),
+    (
+        r#"{"type":"login_failed","method":"password","reason":"invalid password","ip":"203.0.113.7","observed_at":300}"#,
+        "⚠️ 面板登录失败（password），来自 203.0.113.7",
+    ),
 ];
 
-/// 三种事件都渲染成中文文案发到 Telegram，URL 带上 kv 里的 bot token。
+/// 每种事件都渲染成中文文案发到 Telegram，URL 带上 kv 里的 bot token。
 #[test]
-fn delivers_all_three_events_to_telegram() {
+fn delivers_every_event_to_telegram() {
     let wasm = build_wasm();
     let mut host = Host::default();
     host.kv.insert("bot_token".into(), "123456:TEST-TOKEN".into());
@@ -242,7 +250,7 @@ fn delivers_all_three_events_to_telegram() {
     }
 
     let calls = store.data().http_calls.lock().unwrap().clone();
-    assert_eq!(calls.len(), 3, "三种事件各发一条 sendMessage");
+    assert_eq!(calls.len(), CASES.len(), "每种事件各发一条 sendMessage");
     for (call, (_, expected_text)) in calls.iter().zip(CASES) {
         assert_eq!(call.method, "POST", "v1 宿主只接受 POST");
         assert_eq!(call.url, "https://api.telegram.org/bot123456:TEST-TOKEN/sendMessage");
@@ -338,6 +346,8 @@ fn built_in_text_behaves_exactly_like_the_manifest_default() {
         (CASES[0].0, "template_expiry_soon"),
         (CASES[1].0, "template_agent_offline"),
         (CASES[2].0, "template_agent_online"),
+        (CASES[3].0, "template_login_succeeded"),
+        (CASES[4].0, "template_login_failed"),
     ];
     for (payload, key) in cases {
         let (mut store, instance) = instantiate(&engine(), &wasm, bare_host());

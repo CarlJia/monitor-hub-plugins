@@ -1,9 +1,9 @@
 # tg-notify
 
 monitor-hub 的内置示例通知插件，wasm 插件 ABI v2 的参考实现——订阅宿主的
-离线/在线事件与财务插件发出的 `plugin_expiry_soon`，把通知渲染成中文
-文案，经 Telegram Bot API 的 `sendMessage` 发出。完整的 ABI 文档见仓库根
-README 的「插件开发」章节，权威实现见 `src/plugin/`。
+离线/在线事件、面板登录成功/失败事件与财务插件发出的 `plugin_expiry_soon`，
+把通知渲染成中文文案，经 Telegram Bot API 的 `sendMessage` 发出。完整的 ABI
+文档见仓库根 README 的「插件开发」章节，权威实现见 `src/plugin/`。
 
 ## 行为
 
@@ -12,8 +12,10 @@ README 的「插件开发」章节，权威实现见 `src/plugin/`。
 | `plugin_expiry_soon` | ⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天） | `{name}` `{expires_at}` `{days_left}` `{threshold_days}` `{node_id}` |
 | `agent_offline` | 🔴 节点 {name} 已离线（最后上报于 N 秒前） | `{name}` `{silent_for}` `{observed_at}` `{last_seen_at}` `{node_id}` |
 | `agent_online` | 🟢 节点 {name} 已恢复在线 | `{name}` `{observed_at}` `{node_id}` |
+| `login_succeeded` | ✅ 面板登录成功（{method}）{actor}，来自 {ip}，时间 N | `{method}` `{actor}` `{ip}` `{observed_at}` |
+| `login_failed` | ⚠️ 面板登录失败（{method}），来自 {ip}，时间 N；原因：{reason} | `{method}` `{reason}` `{ip}` `{observed_at}` |
 
-三类文案都能在面板的「配置」里改（三个 `template_*` kv，都是非必填）：
+各类文案都能在面板的「配置」里改（每类一个 `template_*` kv，都是非必填）：
 
 - 模板用 `{占位符}` 插值，**按 Telegram 的 HTML 富样式写**（插件用
   `parse_mode: "HTML"` 发送），例如 `<b>{name}</b> 掉了`。模板原文原样发出；
@@ -30,6 +32,12 @@ README 的「插件开发」章节，权威实现见 `src/plugin/`。
 > ABI v2 起宿主的到期检测退役，`expiry_soon` 事件由财务统计插件经
 > `emit_event` 发出，事件名带 `plugin_` 前缀。未启用财务插件的部署不再有
 > 到期通知。
+
+> `login_succeeded` / `login_failed` 是宿主发的面板登录事件：密码登录与 GitHub
+> 登录各有成功/失败两路。`{method}` 是渠道（`password` / `github`），`{actor}`
+> 是登录主体（GitHub 用户名；应急密码没有账号，为空），失败另带 `{reason}`。
+> 两者都带发起端 `{ip}`。要收登录通知需宿主支持这两个事件名（monitor v2.1.0
+> 之后）；只想收失败告警的话，只订阅 `login_failed` 即可。
 
 `on_event` 返回码：
 
