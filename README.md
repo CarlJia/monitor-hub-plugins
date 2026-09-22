@@ -11,7 +11,7 @@ monitor-hub 的 WASM 插件仓库（ABI v2）。
 **ABI 文档与宿主实现在 monitor 仓**，本仓不复制：
 
 - ABI 字段表 / 插件开发指南：见 monitor 仓 `README.md` 的「插件开发」章节
-- 宿主函数实现：`monitor/src/plugin/host_funcs.rs`（14 个宿主函数）
+- 宿主函数实现在 [`monitor/crates/monitor-plugin-contract/src/host_linker.rs`](https://github.com/CarlJia/monitor/blob/main/crates/monitor-plugin-contract/src/host_linker.rs)（**13** 个 `func_wrap`）。`monitor/src/plugin/host_funcs.rs` 只把 linker 委托给 contract crate。
 - Manifest 校验：`monitor/src/plugin/manifest.rs`
 
 拆仓后 ABI 文档与 host 实现留在 monitor；插件仓通过反向链接引用，避免双源真相漂移。
