@@ -872,6 +872,24 @@ fn money(code: &str, amount: f64) -> String {
     }
 }
 
+/// 编辑表「折算价格」列的文案：每行按目标币种换算后的金额。免费的机器不显
+/// 数字（与到期表的「免费」备注同源），汇率缺失（无缓存、源币种不在
+/// Frankfurter 表里）印「—」——与汇总那两格的处理对齐，免得同一页面里「—
+/// 」与「空」两种空态各占一半。汇率齐时按 `money` 格式化，符号、位数与小
+/// 数点都和汇总那一行同源。
+fn display_price_text(fx: Option<&Fx>, n: &NodeFin, target: &str) -> String {
+    if is_free(n) {
+        return FREE_LABEL.to_owned();
+    }
+    let Some(fx) = fx else {
+        return "—".to_owned();
+    };
+    match convert(fx, n.price, &n.currency) {
+        Some(v) => money(target, v),
+        None => "—".to_owned(),
+    }
+}
+
 /// 币种下拉的选项：展示「¥ CNY」、提交 `CNY`（KTD5 的 `{value,label}` 形态）。
 fn currency_options() -> Vec<Value> {
     CURRENCIES
@@ -1054,6 +1072,10 @@ fn build_page(allow_fetch: bool) -> Value {
             // 价格列的前缀（币种符号）与同一行的币种绑在一起发给面板：前端照
             // 字段声明里的 prefix_key 取它，不用认识币种代码。
             "price_symbol": currency_prefix(&n.currency),
+            // 折算价格：按目标币种换算后的金额，文案由插件拼好——面板只照
+            // 字段声明里的 type=text 渲染，不参与货币换算（汇率、符号、缺值都
+            // 已在拼好的字符串里闭环）。免费机器显「免费」，汇率缺失显「—」。
+            "display_price": display_price_text(fx.as_ref(), n, &target),
             "currency": &n.currency,
             "billing_cycle": &n.billing_cycle,
             "expires_at": &n.expires_at,
@@ -1096,6 +1118,10 @@ fn build_page(allow_fetch: bool) -> Value {
         "fields": [
             {"name": "name", "label": "节点名", "type": "text"},
             {"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
+            // 折算价格：每行按目标币种换算后的金额，由插件拼好后塞进字符串列。
+            // type=text 避免面板再按 money 解析（钱符/小数点已在字符串里闭环），
+            // 编辑表单不会把它当可改字段收集——save_node 也只读它认得的那几个 key。
+            {"name": "display_price", "label": "折算价格", "type": "text"},
             {"name": "currency", "label": "币种", "type": "select", "options": currency_options()},
             {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": cycle_options()},
             {"name": "expires_at", "label": "到期日", "type": "date"},

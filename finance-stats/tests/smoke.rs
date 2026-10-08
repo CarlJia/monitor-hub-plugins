@@ -1250,6 +1250,84 @@ fn currency_symbols_follow_the_target_currency() {
     assert_eq!(rows[0]["price_symbol"], "$", "换展示币种不该动节点自己的币种：{rows:?}");
 }
 
+/// 编辑表加一列「折算价格」：每行按目标币种换算后的金额。免费节点显示「免费」；
+/// 汇率缺失（无缓存或源币种不在 Frankfurter 表里）显示「—」。同币种（节点币种 =
+/// 目标币种）直接按本币种 `money()` 格式化——与汇总那两格同源、同一份符号表。
+#[test]
+fn form_table_shows_price_converted_to_target_currency() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    declare_host_nodes(&host, &[(1, "paid-usd"), (2, "paid-cny"), (3, "gratis")]);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+    seed(&store, "node:1", &node_record("paid-usd", 10.0, "USD", "monthly", None));
+    seed(&store, "node:2", &node_record("paid-cny", 10.0, "CNY", "yearly", None));
+    seed(&store, "node:3", &node_record("gratis", 0.0, "USD", "free", None));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    // 字段声明要新增一条「折算价格」，紧跟「价格」之后——它的位置是表格列序的一
+    // 部分：行里这一列的值就靠它对位的字段名取。
+    let form = form_block(&page);
+    let names: Vec<&str> = form["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    let price_idx = names.iter().position(|n| *n == "price").expect("应有 price 字段");
+    let display_idx = names
+        .iter()
+        .position(|n| *n == "display_price")
+        .unwrap_or_else(|| panic!("字段声明应有 display_price：{names:?}"));
+    assert_eq!(display_idx, price_idx + 1, "折算价格列应紧跟价格列：{names:?}");
+    let field = form["fields"].as_array().unwrap()[display_idx].clone();
+    assert_eq!(field["label"], "折算价格", "列名应是「折算价格」：{field}");
+    assert_eq!(field["type"], "text", "读出来是文本，避免面板把它当 money 解析：{field}");
+
+    // 行值：10 USD → 1/0.14 CNY；10 CNY → 10 CNY；免费 → "免费"。
+    let rows = form["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["display_price"], "¥71.43", "10 USD ≈ 71.43 CNY：{rows:?}");
+    assert_eq!(rows[1]["display_price"], "¥10.00", "同币种直接按本币种格式化：{rows:?}");
+    assert_eq!(rows[2]["display_price"], "免费", "免费的机器不显示金额：{rows:?}");
+
+    // 切到 EUR：每行折算价格应立刻跟新目标币种重算，不依赖节点自己的币种。
+    // mock body 一直不变（rates[USD]=0.14, rates[CNY]=1.0），target=EUR 后只是
+    // base 改写、符号换成 €，数值与 base=CNY 那次同根：10/0.14≈71.43，10/1.0=10。
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"set_currency","value":"EUR"}"#,
+    ))
+    .unwrap();
+    let rows = form_block(&resp)["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["display_price"], "€71.43", "切到 EUR 后 10 USD 折成 10/0.14 EUR：{rows:?}");
+    assert_eq!(rows[1]["display_price"], "€10.00", "10 CNY 在 rates[CNY]=1.0 下折成 10 EUR：{rows:?}");
+    assert_eq!(rows[2]["display_price"], "免费", "免费机器与目标币种无关：{rows:?}");
+}
+
+/// 汇率不可用时折算价格列显示「—」——与汇总那两格同一处理。
+#[test]
+fn display_price_is_dash_when_fx_unavailable() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    // http_body 留空：render_page 里允许的初次拉取会拿 -4 失败，没缓存。
+    declare_host_nodes(&host, &[(1, "paid")]);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7}"#);
+    seed(&store, "node:1", &node_record("paid", 10.0, "USD", "monthly", None));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+    let rows = form_block(&page)["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["display_price"], "—", "汇率缺失时折算价格印「—」：{rows:?}");
+}
+
 /// 页面行序必须与 hub 的节点列表一致。hub 列表来自 `SELECT * FROM node ORDER BY
 /// sort, id`（用户拖拽排序优先，数字 id 兜底），而 `nodes_query` 回给插件的**正
 /// 是这一个顺序**——插件必须原样沿用，不能按记录键重排。
@@ -1509,7 +1587,7 @@ fn form_fields_declare_labels_and_select_options() {
         form["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["name", "price", "currency", "billing_cycle", "expires_at"],
+        ["name", "price", "display_price", "currency", "billing_cycle", "expires_at"],
         "字段集合与顺序不变：{form}"
     );
 
@@ -1517,6 +1595,7 @@ fn form_fields_declare_labels_and_select_options() {
     for (name, label) in [
         ("name", "节点名"),
         ("price", "价格"),
+        ("display_price", "折算价格"),
         ("currency", "币种"),
         ("billing_cycle", "计费周期"),
         ("expires_at", "到期日"),
@@ -1525,9 +1604,12 @@ fn form_fields_declare_labels_and_select_options() {
     }
 
     // 控件类型（R2）。价格是 `money`（右对齐、两位小数），前缀取自同行
-    // `price_symbol` 那一列——面板据此把币种符号摆在价格前。
+    // `price_symbol` 那一列——面板据此把币种符号摆在价格前。折算价格是 `text`：
+    // 金额已由插件按目标币种拼好（钱符 + 两位小数都在字符串里），面板照文本渲
+    // 染即可；type=money 会让面板再按 money 解析，反倒多此一举。
     assert_eq!(field_of(form, "price")["type"], "money");
     assert_eq!(field_of(form, "price")["prefix_key"], "price_symbol");
+    assert_eq!(field_of(form, "display_price")["type"], "text");
     assert_eq!(field_of(form, "expires_at")["type"], "date");
     assert_eq!(field_of(form, "name")["type"], "text");
     assert_eq!(field_of(form, "currency")["type"], "select");
