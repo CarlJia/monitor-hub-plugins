@@ -1269,8 +1269,8 @@ fn form_table_shows_price_converted_to_target_currency() {
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
 
-    // 字段声明要新增一条「折算价格」，紧跟「价格」之后——它的位置是表格列序的一
-    // 部分：行里这一列的值就靠它对位的字段名取。
+    // 字段声明要新增一条「折算价格」，放在「价格」**之前**——目标币种下的金额
+    // 是页面主视图（汇总那两格都用它），原币种的价格跟在它后面作为源数据。
     let form = form_block(&page);
     let names: Vec<&str> = form["fields"]
         .as_array()
@@ -1283,7 +1283,7 @@ fn form_table_shows_price_converted_to_target_currency() {
         .iter()
         .position(|n| *n == "display_price")
         .unwrap_or_else(|| panic!("字段声明应有 display_price：{names:?}"));
-    assert_eq!(display_idx, price_idx + 1, "折算价格列应紧跟价格列：{names:?}");
+    assert_eq!(display_idx, price_idx - 1, "折算价格列应在价格列之前：{names:?}");
     let field = form["fields"].as_array().unwrap()[display_idx].clone();
     assert_eq!(field["label"], "折算价格", "列名应是「折算价格」：{field}");
     assert_eq!(field["type"], "text", "读出来是文本，避免面板把它当 money 解析：{field}");
@@ -1587,15 +1587,15 @@ fn form_fields_declare_labels_and_select_options() {
         form["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["name", "price", "display_price", "currency", "billing_cycle", "expires_at"],
+        ["name", "display_price", "price", "currency", "billing_cycle", "expires_at"],
         "字段集合与顺序不变：{form}"
     );
 
     // 中文列头（R1）。
     for (name, label) in [
         ("name", "节点名"),
-        ("price", "价格"),
         ("display_price", "折算价格"),
+        ("price", "价格"),
         ("currency", "币种"),
         ("billing_cycle", "计费周期"),
         ("expires_at", "到期日"),

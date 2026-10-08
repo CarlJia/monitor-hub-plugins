@@ -1117,11 +1117,12 @@ fn build_page(allow_fetch: bool) -> Value {
         "action": "save_node",
         "fields": [
             {"name": "name", "label": "节点名", "type": "text"},
-            {"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
-            // 折算价格：每行按目标币种换算后的金额，由插件拼好后塞进字符串列。
-            // type=text 避免面板再按 money 解析（钱符/小数点已在字符串里闭环），
-            // 编辑表单不会把它当可改字段收集——save_node 也只读它认得的那几个 key。
+            // 折算价格放在「价格」列**之前**：目标币种下的金额是页面主视图
+            // （汇总那两格都用它），原币种的价格作为该机器的源数据跟在后面。
+            // 文案由插件按目标币种拼好，type=text 避免面板再按 money 解析；
+            // save_node 不认这个 key，编辑表单不会把它当可改字段。
             {"name": "display_price", "label": "折算价格", "type": "text"},
+            {"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
             {"name": "currency", "label": "币种", "type": "select", "options": currency_options()},
             {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": cycle_options()},
             {"name": "expires_at", "label": "到期日", "type": "date"},
