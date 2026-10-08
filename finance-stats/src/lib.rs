@@ -1073,8 +1073,9 @@ fn build_page(allow_fetch: bool) -> Value {
             // 字段声明里的 prefix_key 取它，不用认识币种代码。
             "price_symbol": currency_prefix(&n.currency),
             // 折算价格：按目标币种换算后的金额，文案由插件拼好——面板只照
-            // 字段声明里的 type=text 渲染，不参与货币换算（汇率、符号、缺值都
-            // 已在拼好的字符串里闭环）。免费机器显「免费」，汇率缺失显「—」。
+            // 字段声明里的 type=static 当纯文本展示，不参与货币换算（汇率、
+            // 符号、缺值都已在拼好的字符串里闭环）。免费机器显「免费」，汇率
+            // 缺失显「—」。
             "display_price": display_price_text(fx.as_ref(), n, &target),
             "currency": &n.currency,
             "billing_cycle": &n.billing_cycle,
@@ -1119,9 +1120,10 @@ fn build_page(allow_fetch: bool) -> Value {
             {"name": "name", "label": "节点名", "type": "text"},
             // 折算价格放在「价格」列**之前**：目标币种下的金额是页面主视图
             // （汇总那两格都用它），原币种的价格作为该机器的源数据跟在后面。
-            // 文案由插件按目标币种拼好，type=text 避免面板再按 money 解析；
-            // save_node 不认这个 key，编辑表单不会把它当可改字段。
-            {"name": "display_price", "label": "折算价格", "type": "text"},
+            // 声明成 `static`：它是派生值，面板只展示、不渲染输入控件，也不把
+            // 它放进提交载荷——操作员不会对着一个改不动又不生效的框发呆。
+            // （宿主未支持 `static` 时按字段名回退成文本输入框，即旧行为。）
+            {"name": "display_price", "label": "折算价格", "type": "static"},
             {"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
             {"name": "currency", "label": "币种", "type": "select", "options": currency_options()},
             {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": cycle_options()},

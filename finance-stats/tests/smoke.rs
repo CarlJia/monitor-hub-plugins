@@ -1286,7 +1286,10 @@ fn form_table_shows_price_converted_to_target_currency() {
     assert_eq!(display_idx, price_idx - 1, "折算价格列应在价格列之前：{names:?}");
     let field = form["fields"].as_array().unwrap()[display_idx].clone();
     assert_eq!(field["label"], "折算价格", "列名应是「折算价格」：{field}");
-    assert_eq!(field["type"], "text", "读出来是文本，避免面板把它当 money 解析：{field}");
+    assert_eq!(
+        field["type"], "static",
+        "折算价格是派生值，声明成 static 让面板只展示、不渲染可改的输入框：{field}"
+    );
 
     // 行值：10 USD → 1/0.14 CNY；10 CNY → 10 CNY；免费 → "免费"。
     let rows = form["rows"].as_array().unwrap();
@@ -1604,12 +1607,13 @@ fn form_fields_declare_labels_and_select_options() {
     }
 
     // 控件类型（R2）。价格是 `money`（右对齐、两位小数），前缀取自同行
-    // `price_symbol` 那一列——面板据此把币种符号摆在价格前。折算价格是 `text`：
-    // 金额已由插件按目标币种拼好（钱符 + 两位小数都在字符串里），面板照文本渲
-    // 染即可；type=money 会让面板再按 money 解析，反倒多此一举。
+    // `price_symbol` 那一列——面板据此把币种符号摆在价格前。折算价格是
+    // `static`：金额已由插件按目标币种拼好（钱符 + 两位小数都在字符串里），
+    // 面板只当纯文本展示、不渲染输入控件，也不把它放进提交载荷——它是派生值，
+    // 操作员改不动也好。
     assert_eq!(field_of(form, "price")["type"], "money");
     assert_eq!(field_of(form, "price")["prefix_key"], "price_symbol");
-    assert_eq!(field_of(form, "display_price")["type"], "text");
+    assert_eq!(field_of(form, "display_price")["type"], "static");
     assert_eq!(field_of(form, "expires_at")["type"], "date");
     assert_eq!(field_of(form, "name")["type"], "text");
     assert_eq!(field_of(form, "currency")["type"], "select");
